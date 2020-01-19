@@ -2,24 +2,25 @@ package commitlog
 
 import "github.com/liftbridge-io/liftbridge/server/proto"
 
+// Message is a message read from the log.
 type Message []byte
 
-func (m Message) Crc() int32 {
-	return int32(proto.Encoding.Uint32(m))
+// Crc returns the CRC32 digest of the message.
+func (m Message) Crc() uint32 {
+	return proto.Encoding.Uint32(m)
 }
 
+// MagicByte returns the byte used for encoding protocol version detection.
 func (m Message) MagicByte() int8 {
 	return int8(m[4])
 }
 
+// Attributes returns the byte used for message flags.
 func (m Message) Attributes() int8 {
 	return int8(m[5])
 }
 
-func (m Message) Timestamp() int64 {
-	return int64(proto.Encoding.Uint64(m[6:]))
-}
-
+// Key returns the message key.
 func (m Message) Key() []byte {
 	start, end, size := m.keyOffsets()
 	if size == -1 {
@@ -28,6 +29,7 @@ func (m Message) Key() []byte {
 	return m[start+4 : end]
 }
 
+// Value returns the message value.
 func (m Message) Value() []byte {
 	start, end, size := m.valueOffsets()
 	if size == -1 {
@@ -36,6 +38,7 @@ func (m Message) Value() []byte {
 	return m[start+4 : end]
 }
 
+// Headers returns the message headers map.
 func (m Message) Headers() map[string][]byte {
 	var (
 		_, valueEnd, _ = m.valueOffsets()
@@ -59,7 +62,7 @@ func (m Message) Headers() map[string][]byte {
 }
 
 func (m Message) keyOffsets() (start, end, size int32) {
-	start = 14
+	start = 6
 	size = int32(proto.Encoding.Uint32(m[start:]))
 	end = start + 4
 	if size != -1 {
@@ -72,6 +75,9 @@ func (m Message) valueOffsets() (start, end, size int32) {
 	_, keyEnd, _ := m.keyOffsets()
 	start = keyEnd
 	size = int32(proto.Encoding.Uint32(m[start:]))
-	end = start + 4 + size
+	end = start + 4
+	if size != -1 {
+		end += size
+	}
 	return
 }

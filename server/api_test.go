@@ -1,18 +1,20 @@
 package server
 
 import (
+	"context"
 	"fmt"
 	"strconv"
 	"testing"
 	"time"
 
-	"github.com/liftbridge-io/go-liftbridge"
-	"github.com/liftbridge-io/go-liftbridge/liftbridge-grpc"
-	natsdTest "github.com/nats-io/gnatsd/test"
-	"github.com/nats-io/go-nats"
+	natsdTest "github.com/nats-io/nats-server/v2/test"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/net/context"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	lift "github.com/liftbridge-io/go-liftbridge"
+	proto "github.com/liftbridge-io/liftbridge-api/go"
 )
 
 type message struct {
@@ -43,20 +45,16 @@ func TestCreateStream(t *testing.T) {
 
 	getMetadataLeader(t, 10*time.Second, s1)
 
-	client, err := liftbridge.Connect([]string{"localhost:5050"})
+	client, err := lift.Connect([]string{"localhost:5050"})
 	require.NoError(t, err)
+	defer client.Close()
 
-	stream := liftbridge.StreamInfo{
-		Name:              "foo",
-		Subject:           "foo",
-		ReplicationFactor: 1,
-	}
-	err = client.CreateStream(context.Background(), stream)
+	err = client.CreateStream(context.Background(), "foo", "bar")
 	require.NoError(t, err)
 
 	// Creating the same stream returns ErrStreamExists.
-	err = client.CreateStream(context.Background(), stream)
-	require.Equal(t, liftbridge.ErrStreamExists, err)
+	err = client.CreateStream(context.Background(), "foo", "bar")
+	require.Equal(t, lift.ErrStreamExists, err)
 }
 
 // Ensure creating a stream works when we send the request to the metadata
@@ -81,20 +79,52 @@ func TestCreateStreamPropagate(t *testing.T) {
 	getMetadataLeader(t, 10*time.Second, s1, s2)
 
 	// Connect and send the request to the follower.
-	client, err := liftbridge.Connect([]string{"localhost:5050"})
+	client, err := lift.Connect([]string{"localhost:5050"})
 	require.NoError(t, err)
+	defer client.Close()
 
-	stream := liftbridge.StreamInfo{
-		Name:              "foo",
-		Subject:           "foo",
-		ReplicationFactor: 1,
-	}
-	err = client.CreateStream(context.Background(), stream)
+	err = client.CreateStream(context.Background(), "foo", "foo")
 	require.NoError(t, err)
 
 	// Creating the same stream returns ErrStreamExists.
-	err = client.CreateStream(context.Background(), stream)
-	require.Equal(t, liftbridge.ErrStreamExists, err)
+	err = client.CreateStream(context.Background(), "foo", "foo")
+	require.Equal(t, lift.ErrStreamExists, err)
+}
+
+// Ensure creating a stream fails when there is no known metadata leader.
+func TestCreateStreamNoMetadataLeader(t *testing.T) {
+	defer cleanupStorage(t)
+
+	// Use a central NATS server.
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	// Configure first server.
+	s1Config := getTestConfig("a", true, 0)
+	s1 := runServerWithConfig(t, s1Config)
+	defer s1.Stop()
+
+	// Configure second server.
+	s2Config := getTestConfig("b", false, 5050)
+	s2 := runServerWithConfig(t, s2Config)
+	defer s2.Stop()
+
+	// Wait for a leader to be elected to allow the cluster to form, then stop
+	// a server and wait for the leader to step down.
+	getMetadataLeader(t, 10*time.Second, s1, s2)
+	s1.Stop()
+	waitForNoMetadataLeader(t, 10*time.Second, s1, s2)
+
+	// Connect and send the request to the follower.
+	client, err := lift.Connect([]string{"localhost:5050"})
+	require.NoError(t, err)
+	defer client.Close()
+
+	err = client.CreateStream(context.Background(), "foo", "foo")
+	require.Error(t, err)
+	st := status.Convert(err)
+	require.Equal(t, "No known metadata leader", st.Message())
+	require.Equal(t, codes.Internal, st.Code())
 }
 
 // Ensure creating a stream fails when the replication factor is greater than
@@ -113,16 +143,41 @@ func TestCreateStreamInsufficientReplicas(t *testing.T) {
 
 	getMetadataLeader(t, 10*time.Second, s1)
 
-	client, err := liftbridge.Connect([]string{"localhost:5050"})
+	client, err := lift.Connect([]string{"localhost:5050"})
+	require.NoError(t, err)
+	defer client.Close()
+
+	err = client.CreateStream(context.Background(), "foo", "foo",
+		lift.ReplicationFactor(2))
+	require.Error(t, err)
+}
+
+// Ensure when a partitioned stream is created the correct number of partitions
+// are made.
+func TestCreateStreamPartitioned(t *testing.T) {
+	defer cleanupStorage(t)
+
+	// Use a central NATS server.
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	// Configure server.
+	s1Config := getTestConfig("a", true, 5050)
+	s1 := runServerWithConfig(t, s1Config)
+	defer s1.Stop()
+
+	getMetadataLeader(t, 10*time.Second, s1)
+
+	client, err := lift.Connect([]string{"localhost:5050"})
+	require.NoError(t, err)
+	defer client.Close()
+
+	err = client.CreateStream(context.Background(), "foo", "foo", lift.Partitions(3))
 	require.NoError(t, err)
 
-	stream := liftbridge.StreamInfo{
-		Name:              "foo",
-		Subject:           "foo",
-		ReplicationFactor: 2,
-	}
-	err = client.CreateStream(context.Background(), stream)
-	require.Error(t, err)
+	stream := s1.metadata.GetStream("foo")
+	require.NotNil(t, stream)
+	require.Len(t, stream.partitions, 3)
 }
 
 // Ensure subscribing to a non-existent stream returns an error.
@@ -145,14 +200,12 @@ func TestSubscribeStreamNoSuchStream(t *testing.T) {
 	defer conn.Close()
 	apiClient := proto.NewAPIClient(conn)
 
-	stream, err := apiClient.Subscribe(context.Background(), &proto.SubscribeRequest{
-		Subject: "foo",
-		Name:    "foo",
-	})
+	stream, err := apiClient.Subscribe(context.Background(),
+		&proto.SubscribeRequest{Stream: "foo"})
 	require.NoError(t, err)
 	_, err = stream.Recv()
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "No such stream")
+	require.Contains(t, err.Error(), "No such partition")
 }
 
 // Ensure sending a subscribe request to a server that is not the stream leader
@@ -177,24 +230,23 @@ func TestSubscribeStreamNotLeader(t *testing.T) {
 	getMetadataLeader(t, 10*time.Second, s1, s2)
 
 	// Create the stream.
-	client, err := liftbridge.Connect([]string{"localhost:5050"})
+	client, err := lift.Connect([]string{"localhost:5050"})
 	require.NoError(t, err)
+	defer client.Close()
 
-	info := liftbridge.StreamInfo{
-		Name:              "foo",
-		Subject:           "foo",
-		ReplicationFactor: 2,
-	}
-	err = client.CreateStream(context.Background(), info)
+	name := "foo"
+	subject := "foo"
+	err = client.CreateStream(context.Background(), subject, name,
+		lift.ReplicationFactor(2))
 	require.NoError(t, err)
 
 	require.NoError(t, client.Close())
 
 	// Wait for both nodes to create stream.
-	waitForStream(t, 5*time.Second, info.Subject, info.Name, s1, s2)
+	waitForPartition(t, 5*time.Second, name, 0, s1, s2)
 
 	// Connect to the server that is the stream follower.
-	leader := getStreamLeader(t, 10*time.Second, info.Subject, info.Name, s1, s2)
+	leader := getPartitionLeader(t, 10*time.Second, name, 0, s1, s2)
 	var followerConfig *Config
 	if leader == s1 {
 		followerConfig = s2Config
@@ -207,14 +259,11 @@ func TestSubscribeStreamNotLeader(t *testing.T) {
 	apiClient := proto.NewAPIClient(conn)
 
 	// Subscribe on the follower.
-	stream, err := apiClient.Subscribe(context.Background(), &proto.SubscribeRequest{
-		Subject: info.Subject,
-		Name:    info.Name,
-	})
+	stream, err := apiClient.Subscribe(context.Background(), &proto.SubscribeRequest{Stream: name})
 	require.NoError(t, err)
 	_, err = stream.Recv()
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "Server not stream leader")
+	require.Contains(t, err.Error(), "Server not partition leader")
 }
 
 // Ensure publishing and receiving messages on a stream works.
@@ -232,15 +281,13 @@ func TestStreamPublishSubscribe(t *testing.T) {
 
 	getMetadataLeader(t, 10*time.Second, s1)
 
-	client, err := liftbridge.Connect([]string{"localhost:5050"})
+	client, err := lift.Connect([]string{"localhost:5050"})
 	require.NoError(t, err)
+	defer client.Close()
 
-	info := liftbridge.StreamInfo{
-		Name:              "foo",
-		Subject:           "foo",
-		ReplicationFactor: 1,
-	}
-	err = client.CreateStream(context.Background(), info)
+	name := "foo"
+	subject := "foo"
+	err = client.CreateStream(context.Background(), subject, name)
 	require.NoError(t, err)
 
 	num := 5
@@ -255,10 +302,7 @@ func TestStreamPublishSubscribe(t *testing.T) {
 	i := 0
 	ch1 := make(chan struct{})
 	ch2 := make(chan struct{})
-	err = client.Subscribe(context.Background(), info.Subject, info.Name, func(msg *proto.Message, err error) {
-		if i == num+5 && err != nil {
-			return
-		}
+	err = client.Subscribe(context.Background(), name, func(msg *proto.Message, err error) {
 		require.NoError(t, err)
 		expect := expected[i]
 		assertMsg(t, expect, msg)
@@ -272,28 +316,10 @@ func TestStreamPublishSubscribe(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	nc, err := nats.GetDefaultOptions().Connect()
-	require.NoError(t, err)
-	defer nc.Close()
-
-	// Subscribe to acks.
-	acks := "acks"
-	acksRecv := 0
-	gotAcks := make(chan struct{})
-	_, err = nc.Subscribe(acks, func(m *nats.Msg) {
-		_, err := liftbridge.UnmarshalAck(m.Data)
-		require.NoError(t, err)
-		acksRecv++
-		if acksRecv == num+5 {
-			close(gotAcks)
-		}
-	})
-	require.NoError(t, err)
-
 	// Publish messages.
 	for i := 0; i < num; i++ {
-		err = nc.Publish(info.Subject, liftbridge.NewMessage(expected[i].Value,
-			liftbridge.MessageOptions{Key: expected[i].Key, AckInbox: acks}))
+		_, err = client.Publish(context.Background(), subject, expected[i].Value,
+			lift.Key(expected[i].Key))
 		require.NoError(t, err)
 	}
 
@@ -313,8 +339,8 @@ func TestStreamPublishSubscribe(t *testing.T) {
 		})
 	}
 	for i := 0; i < 5; i++ {
-		err = nc.Publish(info.Subject, liftbridge.NewMessage(expected[i+num].Value,
-			liftbridge.MessageOptions{Key: expected[i+num].Key, AckInbox: acks}))
+		_, err = client.Publish(context.Background(), subject, expected[i+num].Value,
+			lift.Key(expected[i+num].Key))
 		require.NoError(t, err)
 	}
 
@@ -325,24 +351,14 @@ func TestStreamPublishSubscribe(t *testing.T) {
 		t.Fatal("Did not receive all expected messages")
 	}
 
-	// Make sure we got all the acks.
-	select {
-	case <-gotAcks:
-	case <-time.After(10 * time.Second):
-		t.Fatal("Did not receive all expected acks")
-	}
-
 	// Make sure we can play back the log.
-	client2, err := liftbridge.Connect([]string{"localhost:5050"})
+	client2, err := lift.Connect([]string{"localhost:5050"})
 	require.NoError(t, err)
 	defer client2.Close()
 	i = num
 	ch1 = make(chan struct{})
-	err = client2.Subscribe(context.Background(), info.Subject, info.Name,
+	err = client2.Subscribe(context.Background(), name,
 		func(msg *proto.Message, err error) {
-			if i == num+5 && err != nil {
-				return
-			}
 			require.NoError(t, err)
 			expect := expected[i]
 			assertMsg(t, expect, msg)
@@ -350,7 +366,7 @@ func TestStreamPublishSubscribe(t *testing.T) {
 			if i == num+5 {
 				close(ch1)
 			}
-		}, liftbridge.StartAtOffset(int64(num)))
+		}, lift.StartAtOffset(int64(num)))
 	require.NoError(t, err)
 
 	select {

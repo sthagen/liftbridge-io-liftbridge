@@ -1,8 +1,13 @@
 package server
 
 import (
+	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
+	"io"
 	"io/ioutil"
+	"math/rand"
 	"net"
 	"os"
 	"path/filepath"
@@ -12,22 +17,18 @@ import (
 	"time"
 
 	"github.com/hashicorp/raft"
-	client "github.com/liftbridge-io/go-liftbridge/liftbridge-grpc"
-	"github.com/nats-io/go-nats"
+	"github.com/nats-io/nats.go"
 	"github.com/pkg/errors"
-	log "github.com/sirupsen/logrus"
-	"golang.org/x/net/context"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 
+	client "github.com/liftbridge-io/liftbridge-api/go"
+	"github.com/liftbridge-io/liftbridge/server/health"
 	"github.com/liftbridge-io/liftbridge/server/logger"
 	"github.com/liftbridge-io/liftbridge/server/proto"
 )
 
-const (
-	stateFile                 = "liftbridge"
-	serverInfoInboxTemplate   = "%s.info"
-	streamStatusInboxTemplate = "%s.status.%s"
-)
+const stateFile = "liftbridge"
 
 // Server is the main Liftbridge object. Create it by calling New or
 // RunServerWithConfig.
@@ -38,13 +39,15 @@ type Server struct {
 	ncRaft             *nats.Conn
 	ncRepl             *nats.Conn
 	ncAcks             *nats.Conn
+	ncPublishes        *nats.Conn
 	logger             logger.Logger
+	loggerOut          io.Writer
 	api                *grpc.Server
 	metadata           *metadataAPI
 	shutdownCh         chan struct{}
-	raft               *raftNode
+	raft               atomic.Value
 	leaderSub          *nats.Subscription
-	startedRecovery    bool
+	recoveryStarted    bool
 	latestRecoveredLog *raft.Log
 	mu                 sync.RWMutex
 	shutdown           bool
@@ -67,15 +70,9 @@ func New(config *Config) *Server {
 	if config.DataDir == "" {
 		config.DataDir = filepath.Join("/tmp", "liftbridge", config.Clustering.Namespace)
 	}
-	logger := log.New()
-	logger.SetLevel(log.Level(config.LogLevel))
-	logFormatter := &log.TextFormatter{
-		FullTimestamp:   true,
-		TimestampFormat: "2006-01-02 15:04:05",
-	}
-	logger.Formatter = logFormatter
-	if config.NoLog {
-		logger.Out = ioutil.Discard
+	logger := logger.NewLogger(config.LogLevel)
+	if config.LogSilent {
+		logger.SetWriter(ioutil.Discard)
 	}
 	s := &Server{
 		config:     config,
@@ -88,7 +85,15 @@ func New(config *Config) *Server {
 
 // Start the Server. This is not a blocking call. It will return an error if
 // the Server cannot start properly.
-func (s *Server) Start() error {
+func (s *Server) Start() (err error) {
+	defer func() {
+		if err != nil {
+			s.Stop()
+		}
+	}()
+
+	rand.Seed(time.Now().UnixNano())
+
 	// Remove server's ID from the cluster peers list if present.
 	if len(s.config.Clustering.RaftBootstrapPeers) > 0 {
 		peers := make([]string, 0, len(s.config.Clustering.RaftBootstrapPeers))
@@ -100,123 +105,76 @@ func (s *Server) Start() error {
 		s.config.Clustering.RaftBootstrapPeers = peers
 	}
 
+	// Create the data directory if it doesn't exist.
 	if err := os.MkdirAll(s.config.DataDir, os.ModePerm); err != nil {
 		return errors.Wrap(err, "failed to create data path directories")
 	}
 
-	// Attempt to recover state.
-	file := filepath.Join(s.config.DataDir, stateFile)
-	data, err := ioutil.ReadFile(file)
-	if err == nil {
-		// Recovered previous state.
-		state := &proto.ServerState{}
-		if err := state.Unmarshal(data); err == nil {
-			s.config.Clustering.ServerID = state.ServerID
-		}
+	// Recover and persist metadata state.
+	if err := s.recoverAndPersistState(); err != nil {
+		return errors.Wrap(err, "failed to recover or persist metadata state")
 	}
 
-	// Persist server state.
-	state := &proto.ServerState{ServerID: s.config.Clustering.ServerID}
-	data, err = state.Marshal()
-	if err != nil {
-		panic(err)
-	}
-	if err := ioutil.WriteFile(file, data, 0666); err != nil {
-		return errors.Wrap(err, "failed to persist server state")
+	if err := s.createNATSConns(); err != nil {
+		return errors.Wrap(err, "failed to connect to NATS")
 	}
 
-	hp := net.JoinHostPort(s.config.Host, strconv.Itoa(s.config.Port))
+	listenAddress := s.config.GetListenAddress()
+	hp := net.JoinHostPort(listenAddress.Host, strconv.Itoa(listenAddress.Port))
 	l, err := net.Listen("tcp", hp)
 	if err != nil {
 		return errors.Wrap(err, "failed starting listener")
 	}
 	s.listener = l
 
-	// NATS connection used for stream data.
-	nc, err := s.createNATSConn("streams")
-	if err != nil {
-		s.Stop()
-		return errors.Wrap(err, "failed to connect to NATS")
-	}
-	s.nc = nc
-
-	// NATS connection used for Raft metadata replication.
-	ncr, err := s.createNATSConn("raft")
-	if err != nil {
-		s.Stop()
-		return errors.Wrap(err, "failed to connect to NATS")
-	}
-	s.ncRaft = ncr
-
-	// NATS connection used for stream replication.
-	ncRepl, err := s.createNATSConn("replication")
-	if err != nil {
-		s.Stop()
-		return errors.Wrap(err, "failed to connect to NATS")
-	}
-	s.ncRepl = ncRepl
-
-	// NATS connection used for sending acks.
-	ncAcks, err := s.createNATSConn("acks")
-	if err != nil {
-		s.Stop()
-		return errors.Wrap(err, "failed to connect to NATS")
-	}
-	s.ncAcks = ncAcks
-
-	s.logger.Infof("Server ID: %s", s.config.Clustering.ServerID)
-	s.logger.Infof("Namespace: %s", s.config.Clustering.Namespace)
+	s.logger.Infof("Server ID:        %s", s.config.Clustering.ServerID)
+	s.logger.Infof("Namespace:        %s", s.config.Clustering.Namespace)
+	s.logger.Infof("Retention Policy: %s", s.config.Log.RetentionString())
 	s.logger.Infof("Starting server on %s...",
-		net.JoinHostPort(s.config.Host, strconv.Itoa(l.Addr().(*net.TCPAddr).Port)))
+		net.JoinHostPort(listenAddress.Host, strconv.Itoa(l.Addr().(*net.TCPAddr).Port)))
+
+	// Set a lower bound of one second for LogRollTime to avoid frequent log
+	// rolls which will cause performance problems. This is mainly here because
+	// LogRollTime defaults to RetentionMaxAge if it's not set explicitly, so
+	// users could otherwise unknowingly cause frequent log rolls.
+	if logRollTime := s.config.Log.LogRollTime; logRollTime != 0 && logRollTime < time.Second {
+		s.logger.Info("Defaulting log.roll.time to 1 second to avoid frequent log rolls")
+		s.config.Log.LogRollTime = time.Second
+	}
 
 	if err := s.startMetadataRaft(); err != nil {
-		s.Stop()
 		return errors.Wrap(err, "failed to start Raft node")
 	}
 
-	if _, err := s.ncRaft.Subscribe(s.serverInfoInbox(), s.handleServerInfoRequest); err != nil {
-		s.Stop()
+	if _, err := s.ncRaft.Subscribe(s.getServerInfoInbox(), s.handleServerInfoRequest); err != nil {
 		return errors.Wrap(err, "failed to subscribe to server info subject")
 	}
 
-	if _, err := s.ncRaft.Subscribe(s.streamStatusInbox(), s.handleStreamStatusRequest); err != nil {
-		s.Stop()
-		return errors.Wrap(err, "failed to subscribe to stream status subject")
+	inbox := s.getPartitionStatusInbox(s.config.Clustering.ServerID)
+	if _, err := s.ncRaft.Subscribe(inbox, s.handlePartitionStatusRequest); err != nil {
+		return errors.Wrap(err, "failed to subscribe to partition status subject")
+	}
+
+	inbox = s.getPartitionNotificationInbox(s.config.Clustering.ServerID)
+	if _, err := s.ncRepl.Subscribe(inbox, s.handlePartitionNotification); err != nil {
+		return errors.Wrap(err, "failed to subscribe to partition notification subject")
 	}
 
 	s.handleSignals()
 
-	api := grpc.NewServer()
-	s.api = api
-	client.RegisterAPIServer(api, &apiServer{s})
-	s.mu.Lock()
-	s.running = true
-	s.mu.Unlock()
-	s.startGoroutine(func() {
-		err = api.Serve(s.listener)
-		s.mu.Lock()
-		s.running = false
-		s.mu.Unlock()
-		if err != nil {
-			select {
-			case <-s.shutdownCh:
-				return
-			default:
-				s.logger.Fatal(err)
-			}
-		}
-	})
-	return err
+	return errors.Wrap(s.startAPIServer(), "failed to start API server")
 }
 
 // Stop will attempt to gracefully shut the Server down by signaling the stop
 // and waiting for all goroutines to return.
 func (s *Server) Stop() error {
+	health.SetNotServing()
 	s.mu.Lock()
 	if s.shutdown {
 		s.mu.Unlock()
 		return nil
 	}
+
 	s.logger.Info("Shutting down...")
 
 	close(s.shutdownCh)
@@ -235,13 +193,108 @@ func (s *Server) Stop() error {
 		}
 	}
 
-	if s.raft != nil {
-		if err := s.raft.shutdown(); err != nil {
+	if raft := s.getRaft(); raft != nil {
+		if err := raft.shutdown(); err != nil {
 			s.mu.Unlock()
 			return err
 		}
 	}
 
+	s.closeNATSConns()
+	s.running = false
+	s.shutdown = true
+	s.mu.Unlock()
+
+	// Wait for goroutines to stop.
+	s.goroutineWait.Wait()
+
+	return nil
+}
+
+// IsLeader indicates if the server is currently the metadata leader or not. If
+// consistency is required for an operation, it should be threaded through the
+// Raft cluster since that is the single source of truth. If a server thinks
+// it's leader when it's not, the operation it proposes to the Raft cluster
+// will fail.
+func (s *Server) IsLeader() bool {
+	return atomic.LoadInt64(&(s.getRaft().leader)) == 1
+}
+
+// IsRunning indicates if the server is currently running or has been stopped.
+func (s *Server) IsRunning() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.running
+}
+
+// recoverAndPersistState recovers any existing server metadata state from disk
+// to initialize the server then writes the metadata back to disk.
+func (s *Server) recoverAndPersistState() error {
+	// Attempt to recover state.
+	file := filepath.Join(s.config.DataDir, stateFile)
+	data, err := ioutil.ReadFile(file)
+	if err == nil {
+		// Recovered previous state.
+		state := &proto.ServerState{}
+		if err := state.Unmarshal(data); err == nil {
+			s.config.Clustering.ServerID = state.ServerID
+		}
+	}
+
+	// Persist server state.
+	state := &proto.ServerState{ServerID: s.config.Clustering.ServerID}
+	data, err = state.Marshal()
+	if err != nil {
+		panic(err)
+	}
+	return ioutil.WriteFile(file, data, 0666)
+}
+
+// createNATSConns creates various NATS connections used by the server,
+// including connections for stream data, Raft, replication, acks, and
+// publishes.
+func (s *Server) createNATSConns() error {
+	// NATS connection used for stream data.
+	nc, err := s.createNATSConn("streams")
+	if err != nil {
+		return err
+	}
+	s.nc = nc
+
+	// NATS connection used for Raft metadata replication.
+	ncr, err := s.createNATSConn("raft")
+	if err != nil {
+		return err
+	}
+	s.ncRaft = ncr
+
+	// NATS connection used for stream replication.
+	ncRepl, err := s.createNATSConn("replication")
+	if err != nil {
+		return err
+	}
+	s.ncRepl = ncRepl
+
+	// NATS connection used for sending acks.
+	ncAcks, err := s.createNATSConn("acks")
+	if err != nil {
+		return err
+	}
+	s.ncAcks = ncAcks
+
+	// NATS connection used for publishing messages.
+	ncPublishes, err := s.createNATSConn("publishes")
+	if err != nil {
+		return err
+	}
+	s.ncPublishes = ncPublishes
+	return nil
+}
+
+// closeNATSConns closes the various NATS connections used by the server,
+// including connections for stream data, Raft, replication, acks, and
+// publishes.
+func (s *Server) closeNATSConns() {
 	if s.nc != nil {
 		s.nc.Close()
 	}
@@ -251,13 +304,77 @@ func (s *Server) Stop() error {
 	if s.ncRepl != nil {
 		s.ncRepl.Close()
 	}
+	if s.ncAcks != nil {
+		s.ncAcks.Close()
+	}
+	if s.ncPublishes != nil {
+		s.ncPublishes.Close()
+	}
+}
 
-	s.running = false
-	s.shutdown = true
+// startAPIServer configures and starts the gRPC API server.
+func (s *Server) startAPIServer() error {
+	opts := []grpc.ServerOption{}
+
+	// Setup TLS if key/cert is set.
+	if s.config.TLSKey != "" && s.config.TLSCert != "" {
+		var (
+			config tls.Config
+		)
+
+		certificate, err := tls.LoadX509KeyPair(s.config.TLSCert, s.config.TLSKey)
+		if err != nil {
+			return errors.Wrap(err, "failed to load TLS key pair")
+		}
+
+		config.Certificates = []tls.Certificate{certificate}
+
+		if s.config.TLSClientAuth {
+			config.ClientAuth = tls.RequireAndVerifyClientCert
+
+			if s.config.TLSClientAuthCA != "" {
+				certPool := x509.NewCertPool()
+				ca, err := ioutil.ReadFile(s.config.TLSClientAuthCA)
+				if err != nil {
+					return errors.Wrap(err, "failed to load TLS client ca certificate")
+				}
+
+				if ok := certPool.AppendCertsFromPEM(ca); !ok {
+					return errors.Wrap(err, "failed to append TLS client certificate")
+				}
+
+				config.ClientCAs = certPool
+			}
+		}
+
+		creds := credentials.NewTLS(&config)
+		opts = append(opts, grpc.Creds(creds))
+	}
+
+	api := grpc.NewServer(opts...)
+	s.api = api
+	client.RegisterAPIServer(api, &apiServer{s})
+
+	health.Register(api)
+
+	s.mu.Lock()
+	s.running = true
 	s.mu.Unlock()
-
-	// Wait for goroutines to stop.
-	s.goroutineWait.Wait()
+	s.startGoroutine(func() {
+		health.SetServing()
+		err := api.Serve(s.listener)
+		s.mu.Lock()
+		s.running = false
+		s.mu.Unlock()
+		if err != nil {
+			select {
+			case <-s.shutdownCh:
+				return
+			default:
+				s.logger.Fatal(err)
+			}
+		}
+	})
 
 	return nil
 }
@@ -296,23 +413,6 @@ func (s *Server) createNATSConn(name string) (*nats.Conn, error) {
 	return opts.Connect()
 }
 
-// finishedRecovery should be called when the FSM has finished replaying any
-// unapplied log entries. This will start any streams recovered during the
-// replay.
-func (s *Server) finishedRecovery() (int, error) {
-	count := 0
-	for _, stream := range s.metadata.GetStreams() {
-		recovered, err := stream.StartRecovered()
-		if err != nil {
-			return 0, err
-		}
-		if recovered {
-			count++
-		}
-	}
-	return count, nil
-}
-
 // startMetadataRaft creates and starts an embedded Raft node to participate in
 // the metadata cluster. This will bootstrap using the configured server
 // settings and start a goroutine for automatically responding to Raft
@@ -321,7 +421,7 @@ func (s *Server) startMetadataRaft() error {
 	if err := s.setupMetadataRaft(); err != nil {
 		return err
 	}
-	node := s.raft
+	node := s.getRaft()
 
 	s.startGoroutine(func() {
 		for {
@@ -355,12 +455,27 @@ func (s *Server) startMetadataRaft() error {
 	return nil
 }
 
+// setRaft sets the Raft node for the server. This should only be called once
+// on server start.
+func (s *Server) setRaft(r *raftNode) {
+	s.raft.Store(r)
+}
+
+// getRaft returns the Raft node for the server.
+func (s *Server) getRaft() *raftNode {
+	r := s.raft.Load()
+	if r == nil {
+		return nil
+	}
+	return r.(*raftNode)
+}
+
 // leadershipAcquired should be called when this node is elected leader.
 func (s *Server) leadershipAcquired() error {
 	s.logger.Infof("Server became metadata leader, performing leader promotion actions")
 
 	// Use a barrier to ensure all preceding operations are applied to the FSM.
-	if err := s.raft.Barrier(0).Error(); err != nil {
+	if err := s.getRaft().Barrier(0).Error(); err != nil {
 		return err
 	}
 
@@ -371,7 +486,7 @@ func (s *Server) leadershipAcquired() error {
 	}
 	s.leaderSub = sub
 
-	atomic.StoreInt64(&s.raft.leader, 1)
+	atomic.StoreInt64(&(s.getRaft().leader), 1)
 	return nil
 }
 
@@ -388,17 +503,8 @@ func (s *Server) leadershipLost() error {
 	}
 
 	s.metadata.LostLeadership()
-	atomic.StoreInt64(&s.raft.leader, 0)
+	atomic.StoreInt64(&(s.getRaft().leader), 0)
 	return nil
-}
-
-// isLeader indicates if the server is currently the metadata leader or not. If
-// consistency is required for an operation, it should be threaded through the
-// Raft cluster since that is the single source of truth. If a server thinks
-// it's leader when it's not, the operation it proposes to the Raft cluster
-// will fail.
-func (s *Server) isLeader() bool {
-	return atomic.LoadInt64(&s.raft.leader) == 1
 }
 
 // getPropagateInbox returns the NATS subject used for handling propagated Raft
@@ -414,74 +520,86 @@ func (s *Server) getPropagateInbox() string {
 // a forwarded operation and loses leadership at the same time, the operation
 // will fail when it's proposed to the Raft cluster.
 func (s *Server) handlePropagatedRequest(m *nats.Msg) {
-	if m.Reply == "" {
-		s.logger.Warn("Invalid propagated request: no reply inbox")
-		return
-	}
-	req := &proto.PropagatedRequest{}
+	var (
+		req  = &proto.PropagatedRequest{}
+		resp []byte
+	)
 	if err := req.Unmarshal(m.Data); err != nil {
 		s.logger.Warnf("Invalid propagated request: %v", err)
 		return
 	}
 	switch req.Op {
-	case proto.Op_CREATE_STREAM:
-		resp := &proto.PropagatedResponse{
-			Op:               req.Op,
-			CreateStreamResp: &client.CreateStreamResponse{},
-		}
-		if err := s.metadata.CreateStream(context.Background(), req.CreateStreamOp); err != nil {
-			resp.Error = &proto.Error{Code: uint32(err.Code()), Msg: err.Message()}
-		}
-		data, err := resp.Marshal()
-		if err != nil {
-			panic(err)
-		}
-		s.nc.Publish(m.Reply, data)
+	case proto.Op_CREATE_PARTITION:
+		resp = s.handleCreatePartition(req)
 	case proto.Op_SHRINK_ISR:
-		resp := &proto.PropagatedResponse{
-			Op: req.Op,
-		}
-		if err := s.metadata.ShrinkISR(context.Background(), req.ShrinkISROp); err != nil {
-			resp.Error = &proto.Error{Code: uint32(err.Code()), Msg: err.Message()}
-		}
-		data, err := resp.Marshal()
-		if err != nil {
-			panic(err)
-		}
-		s.nc.Publish(m.Reply, data)
-	case proto.Op_REPORT_LEADER:
-		resp := &proto.PropagatedResponse{
-			Op: req.Op,
-		}
-		if err := s.metadata.ReportLeader(context.Background(), req.ReportLeaderOp); err != nil {
-			resp.Error = &proto.Error{Code: uint32(err.Code()), Msg: err.Message()}
-		}
-		data, err := resp.Marshal()
-		if err != nil {
-			panic(err)
-		}
-		s.nc.Publish(m.Reply, data)
+		resp = s.handleShrinkISR(req)
 	case proto.Op_EXPAND_ISR:
-		resp := &proto.PropagatedResponse{
-			Op: req.Op,
-		}
-		if err := s.metadata.ExpandISR(context.Background(), req.ExpandISROp); err != nil {
-			resp.Error = &proto.Error{Code: uint32(err.Code()), Msg: err.Message()}
-		}
-		data, err := resp.Marshal()
-		if err != nil {
-			panic(err)
-		}
-		s.nc.Publish(m.Reply, data)
+		resp = s.handleExpandISR(req)
+	case proto.Op_REPORT_LEADER:
+		resp = s.handleReportLeader(req)
 	default:
 		s.logger.Warnf("Unknown propagated request operation: %s", req.Op)
+		return
+	}
+	if err := m.Respond(resp); err != nil {
+		s.logger.Errorf("Failed to respond to propagated request: %v", err)
 	}
 }
 
-func (s *Server) isRunning() bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.running
+func (s *Server) handleCreatePartition(req *proto.PropagatedRequest) []byte {
+	resp := &proto.PropagatedResponse{
+		Op: req.Op,
+	}
+	if err := s.metadata.CreatePartition(context.Background(), req.CreatePartitionOp); err != nil {
+		resp.Error = &proto.Error{Code: uint32(err.Code()), Msg: err.Message()}
+	}
+	data, err := resp.Marshal()
+	if err != nil {
+		panic(err)
+	}
+	return data
+}
+
+func (s *Server) handleShrinkISR(req *proto.PropagatedRequest) []byte {
+	resp := &proto.PropagatedResponse{
+		Op: req.Op,
+	}
+	if err := s.metadata.ShrinkISR(context.Background(), req.ShrinkISROp); err != nil {
+		resp.Error = &proto.Error{Code: uint32(err.Code()), Msg: err.Message()}
+	}
+	data, err := resp.Marshal()
+	if err != nil {
+		panic(err)
+	}
+	return data
+}
+
+func (s *Server) handleExpandISR(req *proto.PropagatedRequest) []byte {
+	resp := &proto.PropagatedResponse{
+		Op: req.Op,
+	}
+	if err := s.metadata.ExpandISR(context.Background(), req.ExpandISROp); err != nil {
+		resp.Error = &proto.Error{Code: uint32(err.Code()), Msg: err.Message()}
+	}
+	data, err := resp.Marshal()
+	if err != nil {
+		panic(err)
+	}
+	return data
+}
+
+func (s *Server) handleReportLeader(req *proto.PropagatedRequest) []byte {
+	resp := &proto.PropagatedResponse{
+		Op: req.Op,
+	}
+	if err := s.metadata.ReportLeader(context.Background(), req.ReportLeaderOp); err != nil {
+		resp.Error = &proto.Error{Code: uint32(err.Code()), Msg: err.Message()}
+	}
+	data, err := resp.Marshal()
+	if err != nil {
+		panic(err)
+	}
+	return data
 }
 
 func (s *Server) isShutdown() bool {
@@ -535,13 +653,9 @@ func (s *Server) natsErrorHandler(nc *nats.Conn, sub *nats.Subscription, err err
 // handleServerInfoRequest is a NATS handler used to process requests for
 // server information used in the metadata API.
 func (s *Server) handleServerInfoRequest(m *nats.Msg) {
-	if m.Reply == "" {
-		s.logger.Warn("Dropping server info request with no reply inbox")
-		return
-	}
 	req := &proto.ServerInfoRequest{}
 	if err := req.Unmarshal(m.Data); err != nil {
-		s.logger.Warn("Dropping invalid server info request: %v", err)
+		s.logger.Warnf("Dropping invalid server info request: %v", err)
 		return
 	}
 
@@ -550,37 +664,36 @@ func (s *Server) handleServerInfoRequest(m *nats.Msg) {
 		return
 	}
 
+	connectionAddress := s.config.GetConnectionAddress()
 	data, err := (&proto.ServerInfoResponse{
 		Id:   s.config.Clustering.ServerID,
-		Host: s.config.Host,
-		Port: int32(s.config.Port),
+		Host: connectionAddress.Host,
+		Port: int32(connectionAddress.Port),
 	}).Marshal()
 	if err != nil {
 		panic(err)
 	}
 
-	s.ncRaft.Publish(m.Reply, data)
+	if err := m.Respond(data); err != nil {
+		s.logger.Errorf("Failed to respond to server info request: %v", err)
+	}
 }
 
-// handleStreamStatusRequest is a NATS handler used to process requests
-// querying the status of a stream. This is used as a readiness check to
-// determine if a created stream has actually started.
-func (s *Server) handleStreamStatusRequest(m *nats.Msg) {
-	if m.Reply == "" {
-		s.logger.Warn("Dropping stream status request with no reply inbox")
-		return
-	}
-	req := &proto.StreamStatusRequest{}
+// handlePartitionStatusRequest is a NATS handler used to process requests
+// querying the status of a partition. This is used as a readiness check to
+// determine if a created partition has actually started.
+func (s *Server) handlePartitionStatusRequest(m *nats.Msg) {
+	req := &proto.PartitionStatusRequest{}
 	if err := req.Unmarshal(m.Data); err != nil {
-		s.logger.Warn("Dropping invalid stream status request: %v", err)
+		s.logger.Warnf("Dropping invalid partition status request: %v", err)
 		return
 	}
 
-	stream := s.metadata.GetStream(req.Subject, req.Name)
+	partition := s.metadata.GetPartition(req.Stream, req.Partition)
 
-	resp := &proto.StreamStatusResponse{Exists: stream != nil}
-	if stream != nil {
-		resp.IsLeader = stream.IsLeader()
+	resp := &proto.PartitionStatusResponse{Exists: partition != nil}
+	if partition != nil {
+		resp.IsLeader = partition.IsLeader()
 	}
 
 	data, err := resp.Marshal()
@@ -588,20 +701,56 @@ func (s *Server) handleStreamStatusRequest(m *nats.Msg) {
 		panic(err)
 	}
 
-	s.ncRaft.Publish(m.Reply, data)
+	if err := m.Respond(data); err != nil {
+		s.logger.Errorf("Failed to respond to partition status request: %v", err)
+	}
 }
 
-// serverInfoInbox returns the NATS subject used for handling server
+// handlePartitionNotification is a NATS handler used to process notifications
+// from a leader that new data is available on a partition for the follower to
+// replicate if the follower is idle.
+//
+// When a follower reaches the end of the log, it starts to sleep in between
+// replication requests to avoid overloading the leader. However, this causes
+// added commit latency when new messages are published to the log since the
+// follower is idle. As a result, the leader will note when a follower is
+// caught up and send a notification in order to wake an idle follower back up
+// when new data is written to the log.
+func (s *Server) handlePartitionNotification(m *nats.Msg) {
+	req := &proto.PartitionNotification{}
+	if err := req.Unmarshal(m.Data); err != nil {
+		s.logger.Warnf("Dropping invalid partition notification: %v", err)
+		return
+	}
+
+	partition := s.metadata.GetPartition(req.Stream, req.Partition)
+	if partition == nil {
+		s.logger.Warnf("Dropping invalid partition notification: no partition %d for stream %s",
+			req.Partition, req.Stream)
+		return
+	}
+
+	// Wake the follower up.
+	partition.Notify()
+}
+
+// getServerInfoInbox returns the NATS subject used for handling server
 // information requests.
-func (s *Server) serverInfoInbox() string {
-	return fmt.Sprintf(serverInfoInboxTemplate, s.baseMetadataRaftSubject())
+func (s *Server) getServerInfoInbox() string {
+	return fmt.Sprintf("%s.info", s.baseMetadataRaftSubject())
 }
 
-// streamStatusInbox returns the NATS subject used for handling stream status
-// requests.
-func (s *Server) streamStatusInbox() string {
-	return fmt.Sprintf(streamStatusInboxTemplate, s.baseMetadataRaftSubject(),
-		s.config.Clustering.ServerID)
+// getPartitionStatusInbox returns the NATS subject used for handling stream
+// status requests.
+func (s *Server) getPartitionStatusInbox(id string) string {
+	return fmt.Sprintf("%s.status.%s", s.baseMetadataRaftSubject(), id)
+}
+
+// getPartitionNotificationInbox returns the NATS subject used for leaders to
+// indicate new data is available on a partition for a follower to replicate if
+// the follower is idle.
+func (s *Server) getPartitionNotificationInbox(id string) string {
+	return fmt.Sprintf("%s.notify.%s", s.config.Clustering.Namespace, id)
 }
 
 // startGoroutine starts a goroutine which is managed by the server. This adds

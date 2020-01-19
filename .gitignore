@@ -12,3 +12,13 @@
 
 # Project-local glide cache, RE: https://github.com/Masterminds/glide/issues/736
 .glide/
+
+# Ignore jetbrains goland/idea setting path
+.idea/
+
+# Ignore website node modules and build
+website/node_modules/
+website/build/
+website/deploy/build/
+
+dev/data

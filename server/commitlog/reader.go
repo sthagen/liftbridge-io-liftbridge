@@ -1,51 +1,103 @@
 package commitlog
 
 import (
+	"context"
+	"errors"
 	"io"
 	"sync"
 
-	"github.com/liftbridge-io/liftbridge/server/proto"
-
-	"golang.org/x/net/context"
+	pkgErrors "github.com/pkg/errors"
 )
 
-func ReadMessage(reader io.Reader, headersBuf []byte) (Message, int64, error) {
-	if _, err := reader.Read(headersBuf); err != nil {
-		return nil, 0, err
-	}
-	var (
-		offset = int64(proto.Encoding.Uint64(headersBuf[0:]))
-		size   = proto.Encoding.Uint32(headersBuf[8:])
-		buf    = make([]byte, int(size))
-	)
-	if _, err := reader.Read(buf); err != nil {
-		return nil, 0, err
-	}
-	return Message(buf), offset, nil
+type contextReader interface {
+	Read(context.Context, []byte) (int, error)
 }
 
-type UncommittedReader struct {
-	cl  *CommitLog
-	idx int
+// Reader reads messages atomically from a CommitLog. Readers should not be
+// used concurrently.
+type Reader struct {
+	ctxReader   contextReader
+	offset      int64
+	log         *commitLog
+	uncommitted bool
+}
+
+// NewReader creates a new Reader starting at the given offset. If uncommitted
+// is true, the Reader will read uncommitted messages from the log. Otherwise,
+// it will only return committed messages.
+func (l *commitLog) NewReader(offset int64, uncommitted bool) (*Reader, error) {
+	var (
+		ctxReader contextReader
+		err       error
+	)
+	if uncommitted {
+		ctxReader, err = l.newReaderUncommitted(offset)
+	} else {
+		ctxReader, err = l.newReaderCommitted(offset)
+	}
+	return &Reader{
+		ctxReader:   ctxReader,
+		offset:      offset,
+		log:         l,
+		uncommitted: uncommitted,
+	}, err
+}
+
+// ReadMessage reads a single message from the underlying CommitLog or blocks
+// until one is available. It returns the Message in addition to its offset,
+// timestamp, and leader epoch. This may return uncommitted messages if the
+// reader was created with the uncommitted flag set to true.
+//
+// ReadMessage should not be called concurrently, and the headersBuf slice
+// should have a capacity of at least 28.
+//
+// TODO: Should this just return a MessageSet directly instead of a Message and
+// the MessageSet header values?
+func (r *Reader) ReadMessage(ctx context.Context, headersBuf []byte) (Message, int64, int64, uint64, error) {
+RETRY:
+	msg, offset, timestamp, leaderEpoch, err := readMessage(ctx, r.ctxReader, headersBuf)
+	if err != nil {
+		if pkgErrors.Cause(err) == ErrSegmentReplaced {
+			// ErrSegmentReplaced indicates we attempted to read from a log
+			// segment that was replaced due to compaction, so reinitialize the
+			// contextReader and try again to read from the new segment.
+			if r.uncommitted {
+				r.ctxReader, err = r.log.newReaderUncommitted(r.offset)
+			} else {
+				r.ctxReader, err = r.log.newReaderCommitted(r.offset)
+			}
+			if err != nil {
+				return nil, 0, 0, 0, pkgErrors.Wrap(err, "failed to reinitialize reader")
+			}
+			goto RETRY
+		} else {
+			return nil, 0, 0, 0, err
+		}
+	}
+	r.offset = offset + 1
+	return msg, offset, timestamp, leaderEpoch, err
+}
+
+type uncommittedReader struct {
+	cl  *commitLog
+	seg *segment
 	mu  sync.Mutex
 	pos int64
-	ctx context.Context
 }
 
-func (r *UncommittedReader) Read(p []byte) (n int, err error) {
+func (r *uncommittedReader) Read(ctx context.Context, p []byte) (n int, err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	var (
 		segments = r.cl.Segments()
-		segment  = segments[r.idx]
 		readSize int
 		waiting  bool
 	)
 
 LOOP:
 	for {
-		readSize, err = segment.ReadAt(p[n:], r.pos)
+		readSize, err = r.seg.ReadAt(p[n:], r.pos)
 		n += readSize
 		r.pos += int64(readSize)
 		if err != nil && err != io.EOF {
@@ -62,42 +114,54 @@ LOOP:
 		// We hit the end of the segment.
 		if err == io.EOF && !waiting {
 			// Check if there are more segments.
-			if len(segments) > r.idx+1 {
-				goto NEXT_SEGMENT
+			nextSeg := findSegmentByBaseOffset(segments, r.seg.BaseOffset+1)
+			if nextSeg != nil {
+				r.seg = nextSeg
+				r.pos = 0
+				continue
 			}
 			// Otherwise, wait for segment to be written to (or split).
 			waiting = true
-			if !r.waitForData(segment) {
+			if !r.waitForData(ctx, r.seg) {
 				err = io.EOF
 				break
 			}
+			// At this point, either the segment has more data or, if it was
+			// full, a new segment was rolled. Try to read from the segment
+			// again.
 			continue
 		}
 
+		// We hit an EOF after waiting for data which means a new segment was
+		// rolled, so move to the next segment.
+		segments = r.cl.Segments()
+		nextSeg := findSegmentByBaseOffset(segments, r.seg.BaseOffset+1)
+
 		// If there are not enough segments to read, wait for new segment to be
 		// appended or the context to be canceled.
-		segments = r.cl.Segments()
-		for len(segments) <= r.idx+1 {
-			if !r.waitForData(segment) {
+		for nextSeg == nil {
+			if !r.waitForData(ctx, r.seg) {
 				err = io.EOF
 				break LOOP
 			}
 			segments = r.cl.Segments()
+			nextSeg = findSegmentByBaseOffset(segments, r.seg.BaseOffset+1)
 		}
-
-	NEXT_SEGMENT:
-		r.idx++
-		segment = segments[r.idx]
+		r.seg = nextSeg
 		r.pos = 0
+		waiting = false
 	}
 
 	return n, err
 }
 
-func (r *UncommittedReader) waitForData(seg *Segment) bool {
-	wait := seg.waitForData(r, r.pos)
+func (r *uncommittedReader) waitForData(ctx context.Context, seg *segment) bool {
+	wait := seg.WaitForData(r, r.pos)
 	select {
-	case <-r.ctx.Done():
+	case <-r.cl.closed:
+		seg.removeWaiter(r)
+		return false
+	case <-ctx.Done():
 		seg.removeWaiter(r)
 		return false
 	case <-wait:
@@ -105,52 +169,52 @@ func (r *UncommittedReader) waitForData(seg *Segment) bool {
 	}
 }
 
-// NewReaderUncommitted returns an io.Reader which reads data from the log
+// newReaderUncommitted returns a contextReader which reads data from the log
 // starting at the given offset.
-func (l *CommitLog) NewReaderUncommitted(ctx context.Context, offset int64) (io.Reader, error) {
-	s, idx := findSegment(l.Segments(), offset)
-	if s == nil {
+func (l *commitLog) newReaderUncommitted(offset int64) (contextReader, error) {
+	seg, contains := findSegmentContains(l.Segments(), offset)
+	if seg == nil {
 		return nil, ErrSegmentNotFound
 	}
-	e, err := s.findEntry(offset)
-	if err != nil {
-		return nil, err
+	position := int64(0)
+	if contains {
+		e, err := seg.findEntry(offset)
+		if err != nil {
+			return nil, err
+		}
+		position = e.Position
 	}
-	return &UncommittedReader{
+	return &uncommittedReader{
 		cl:  l,
-		idx: idx,
-		pos: e.Position,
-		ctx: ctx,
+		seg: seg,
+		pos: position,
 	}, nil
 }
 
-type CommittedReader struct {
-	cl    *CommitLog
-	idx   int
+type committedReader struct {
+	cl    *commitLog
+	seg   *segment
+	hwSeg *segment
 	mu    sync.Mutex
 	pos   int64
-	ctx   context.Context
-	hwIdx int
 	hwPos int64
 	hw    int64
 }
 
-func (r *CommittedReader) Read(p []byte) (n int, err error) {
+func (r *committedReader) Read(ctx context.Context, p []byte) (n int, err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	segments := r.cl.Segments()
 
-	var (
-		segments = r.cl.Segments()
-		readSize int
-		hw       int64
-	)
-
-	// If the log was empty, wait for data.
-	if r.hw < 0 {
-		hw = r.cl.HighWatermark()
+	// If seg is nil then the reader offset exceeded the HW, i.e. the log is
+	// either empty or the offset overflows the HW. This means we need to wait
+	// for data.
+	if r.seg == nil {
+		offset := r.hw + 1 // We want to read the next committed message.
+		hw := r.cl.HighWatermark()
 		for hw == r.hw {
 			// The HW has not changed, so wait for it to update.
-			if !r.waitForHW(hw) {
+			if !r.waitForHW(ctx, hw) {
 				err = io.EOF
 				return
 			}
@@ -159,22 +223,38 @@ func (r *CommittedReader) Read(p []byte) (n int, err error) {
 		}
 		r.hw = hw
 		segments = r.cl.Segments()
-		r.hwIdx, r.hwPos, err = getHWPos(segments, r.hw)
+		hwIdx, hwPos, err := getHWPos(segments, r.hw)
 		if err != nil {
-			return
+			return 0, err
 		}
+		r.hwSeg = segments[hwIdx]
+		r.hwPos = hwPos
+		r.seg, _ = findSegment(segments, offset)
+		if r.seg == nil {
+			return 0, ErrSegmentNotFound
+		}
+		entry, err := r.seg.findEntry(offset)
+		if err != nil {
+			return 0, err
+		}
+		r.pos = entry.Position
 	}
 
-	segment := segments[r.idx]
+	return r.readLoop(ctx, p, segments)
+}
 
+func (r *committedReader) readLoop(
+	ctx context.Context, p []byte, segments []*segment) (n int, err error) {
+
+	var readSize int
 LOOP:
 	for {
-		lim := int64(len(p))
-		if r.idx == r.hwIdx {
+		lim := int64(len(p[n:]))
+		if r.seg == r.hwSeg {
 			// If we're reading from the HW segment, read up to the HW pos.
 			lim = min(lim, r.hwPos-r.pos)
 		}
-		readSize, err = segment.ReadAt(p[n:lim], r.pos)
+		readSize, err = r.seg.ReadAt(p[n:lim], r.pos)
 		n += readSize
 		r.pos += int64(readSize)
 		if err != nil && err != io.EOF {
@@ -187,19 +267,24 @@ LOOP:
 			continue
 		}
 
-		// We hit the end of the segment.
+		// We hit the end of the segment, so jump to the next one.
 		if err == io.EOF {
-			r.idx++
-			segment = segments[r.idx]
+			nextSeg := findSegmentByBaseOffset(segments, r.seg.BaseOffset+1)
+			if nextSeg == nil {
+				// QUESTION: Should this ever happen?
+				err = errors.New("no segment to consume")
+				break
+			}
+			r.seg = nextSeg
 			r.pos = 0
 			continue
 		}
 
 		// We hit the HW, so sync the latest.
-		hw = r.cl.HighWatermark()
+		hw := r.cl.HighWatermark()
 		for hw == r.hw {
 			// The HW has not changed, so wait for it to update.
-			if !r.waitForHW(hw) {
+			if !r.waitForHW(ctx, hw) {
 				err = io.EOF
 				break LOOP
 			}
@@ -208,19 +293,24 @@ LOOP:
 		}
 		r.hw = hw
 		segments = r.cl.Segments()
-		r.hwIdx, r.hwPos, err = getHWPos(segments, r.hw)
+		hwIdx, hwPos, err := getHWPos(segments, r.hw)
 		if err != nil {
 			break
 		}
+		r.hwPos = hwPos
+		r.hwSeg = segments[hwIdx]
 	}
 
 	return n, err
 }
 
-func (r *CommittedReader) waitForHW(hw int64) bool {
+func (r *committedReader) waitForHW(ctx context.Context, hw int64) bool {
 	wait := r.cl.waitForHW(r, hw)
 	select {
-	case <-r.ctx.Done():
+	case <-r.cl.closed:
+		r.cl.removeHWWaiter(r)
+		return false
+	case <-ctx.Done():
 		r.cl.removeHWWaiter(r)
 		return false
 	case <-wait:
@@ -228,52 +318,58 @@ func (r *CommittedReader) waitForHW(hw int64) bool {
 	}
 }
 
-// NewReaderCommitted returns an io.Reader which reads only committed data from
-// the log starting at the given offset.
-func (l *CommitLog) NewReaderCommitted(ctx context.Context, offset int64) (io.Reader, error) {
-	hw := l.HighWatermark()
-	if hw == -1 {
-		// The log is empty.
-		return &CommittedReader{
+// newReaderCommitted returns a contextReader which reads only committed data
+// from the log starting at the given offset.
+func (l *commitLog) newReaderCommitted(offset int64) (contextReader, error) {
+	var (
+		hw       = l.HighWatermark()
+		hwPos    = int64(-1)
+		segments = l.Segments()
+		hwSeg    *segment
+	)
+
+	// If offset exceeds HW, wait for the next message. This also covers the
+	// case when the log is empty.
+	if offset > hw {
+		return &committedReader{
 			cl:    l,
-			idx:   0,
-			pos:   0,
-			hwIdx: -1,
-			hwPos: -1,
-			ctx:   ctx,
+			seg:   nil,
+			pos:   -1,
+			hwSeg: hwSeg,
+			hwPos: hwPos,
 			hw:    hw,
 		}, nil
 	}
-	var (
-		segments          = l.Segments()
-		hwIdx, hwPos, err = getHWPos(segments, hw)
-	)
-	if err != nil {
-		return nil, err
+
+	if hw != -1 {
+		hwIdx, hwPosition, err := getHWPos(segments, hw)
+		if err != nil {
+			return nil, err
+		}
+		hwPos = hwPosition
+		hwSeg = segments[hwIdx]
 	}
-	if offset > hw {
-		offset = hw
+
+	position := int64(0)
+	seg, contains := findSegmentContains(segments, offset)
+	if contains {
+		entry, err := seg.findEntry(offset)
+		if err != nil {
+			return nil, err
+		}
+		position = entry.Position
 	}
-	seg, idx := findSegment(segments, offset)
-	if seg == nil {
-		return nil, ErrSegmentNotFound
-	}
-	entry, err := seg.findEntry(offset)
-	if err != nil {
-		return nil, err
-	}
-	return &CommittedReader{
+	return &committedReader{
 		cl:    l,
-		idx:   idx,
-		pos:   entry.Position,
-		hwIdx: hwIdx,
+		seg:   seg,
+		pos:   position,
+		hwSeg: hwSeg,
 		hwPos: hwPos,
-		ctx:   ctx,
 		hw:    hw,
 	}, nil
 }
 
-func getHWPos(segments []*Segment, hw int64) (int, int64, error) {
+func getHWPos(segments []*segment, hw int64) (int, int64, error) {
 	hwSeg, hwIdx := findSegment(segments, hw)
 	if hwSeg == nil {
 		return 0, 0, ErrSegmentNotFound

@@ -11,8 +11,9 @@ import (
 
 	"github.com/hashicorp/raft"
 	"github.com/hashicorp/raft-boltdb"
+	"github.com/nats-io/nats.go"
+
 	"github.com/liftbridge-io/nats-on-a-log"
-	"github.com/nats-io/go-nats"
 
 	"github.com/liftbridge-io/liftbridge/server/proto"
 )
@@ -51,9 +52,7 @@ func (r *raftNode) shutdown() error {
 	r.closed = true
 	r.Unlock()
 	if r.Raft != nil {
-		if err := r.Raft.Shutdown().Error(); err != nil {
-			return err
-		}
+		r.Raft.Shutdown()
 	}
 	if r.transport != nil {
 		if err := r.transport.Close(); err != nil {
@@ -121,17 +120,18 @@ func (s *Server) setupMetadataRaft() error {
 	if err != nil {
 		return err
 	}
-	node := s.raft
+	node := s.getRaft()
 
 	// Bootstrap if there is no previous state and we are starting this node as
 	// a seed or a cluster configuration is provided.
 	bootstrap := !existingState &&
-		(s.config.Clustering.RaftBootstrap || len(s.config.Clustering.RaftBootstrapPeers) > 0)
+		(s.config.Clustering.RaftBootstrapSeed || len(s.config.Clustering.RaftBootstrapPeers) > 0)
 	if bootstrap {
 		if err := s.bootstrapCluster(node.Raft); err != nil {
 			node.shutdown()
 			return err
 		}
+		s.logger.Debug("Successfully bootstrapped metadata Raft group")
 	} else if !existingState {
 		// Attempt to join the cluster if we're not bootstrapping.
 		req, err := (&proto.RaftJoinRequest{
@@ -165,12 +165,14 @@ func (s *Server) setupMetadataRaft() error {
 			joined = true
 			break
 		}
-		if !joined {
+		if joined {
+			s.logger.Debug("Successfully joined metadata Raft group")
+		} else {
 			node.shutdown()
 			return errors.New("failed to join metadata Raft group")
 		}
 	}
-	if s.config.Clustering.RaftBootstrap {
+	if s.config.Clustering.RaftBootstrapSeed {
 		// If node is started with bootstrap, regardless if state exists or
 		// not, try to detect (and report) other nodes in same cluster started
 		// with bootstrap=true.
@@ -185,7 +187,7 @@ func (s *Server) setupMetadataRaft() error {
 // and with the latter taking precedence.
 func (s *Server) bootstrapCluster(node *raft.Raft) error {
 	// Include ourself in the cluster.
-	servers := []raft.Server{raft.Server{
+	servers := []raft.Server{{
 		ID:      raft.ServerID(s.config.Clustering.ServerID),
 		Address: raft.ServerAddress(s.config.Clustering.ServerID),
 	}}
@@ -213,10 +215,10 @@ func (s *Server) detectBootstrapMisconfig() {
 	srvID := []byte(s.config.Clustering.ServerID)
 	subj := fmt.Sprintf("%s.bootstrap", s.baseMetadataRaftSubject())
 	s.ncRaft.Subscribe(subj, func(m *nats.Msg) {
-		if m.Data != nil && m.Reply != "" {
+		if m.Data != nil {
 			// Ignore message to ourself
 			if string(m.Data) != s.config.Clustering.ServerID {
-				s.ncRaft.Publish(m.Reply, srvID)
+				m.Respond(srvID)
 				s.logger.Fatalf("Server %s was also started with raft.bootstrap.seed", string(m.Data))
 			}
 		}
@@ -341,7 +343,7 @@ func (s *Server) createRaftNode() (bool, error) {
 		if err != nil {
 			panic(err)
 		}
-		s.ncRaft.Publish(msg.Reply, r)
+		msg.Respond(r)
 	})
 	if err != nil {
 		node.Shutdown()
@@ -350,14 +352,14 @@ func (s *Server) createRaftNode() (bool, error) {
 		return false, err
 	}
 
-	s.raft = &raftNode{
+	s.setRaft(&raftNode{
 		Raft:      node,
 		store:     logStore,
 		transport: tr,
 		logInput:  logWriter,
 		notifyCh:  raftNotifyCh,
 		joinSub:   sub,
-	}
+	})
 
 	return existingState, nil
 }

@@ -7,7 +7,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nats-io/go-nats"
+	"github.com/dustin/go-humanize"
+	"github.com/hako/durafmt"
+	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nuid"
 	log "github.com/sirupsen/logrus"
 
@@ -24,21 +26,58 @@ const (
 )
 
 const (
-	defaultReplicaMaxLagTime       = 10 * time.Second
-	defaultReplicaMaxLeaderTimeout = 10 * time.Second
+	defaultListenAddress           = "0.0.0.0"
+	defaultConnectionAddress       = "localhost"
+	defaultReplicaMaxLagTime       = 15 * time.Second
+	defaultReplicaMaxLeaderTimeout = 15 * time.Second
+	defaultReplicaMaxIdleWait      = 10 * time.Second
 	defaultRaftSnapshots           = 2
 	defaultRaftCacheSize           = 512
-	defaultRetentionMaxBytes       = -1
 	defaultMetadataCacheMaxAge     = 2 * time.Minute
 	defaultBatchMaxMessages        = 1024
-	defaultReplicaFetchTimeout     = 5 * time.Second
+	defaultReplicaFetchTimeout     = 3 * time.Second
+	defaultMinInsyncReplicas       = 1
+	defaultRetentionMaxAge         = 7 * 24 * time.Hour
+	defaultCleanerInterval         = 5 * time.Minute
+	defaultMaxSegmentBytes         = 1024 * 1024 * 256 // 256MB
+	defaultLogRollTime             = defaultRetentionMaxAge
 )
 
 // LogConfig contains settings for controlling the message log for a stream.
 type LogConfig struct {
-	RetentionMaxBytes int64
-	SegmentMaxBytes   int64
-	Compact           bool
+	RetentionMaxBytes    int64
+	RetentionMaxMessages int64
+	RetentionMaxAge      time.Duration
+	CleanerInterval      time.Duration
+	SegmentMaxBytes      int64
+	LogRollTime          time.Duration
+	Compact              bool
+	CompactMaxGoroutines int
+}
+
+// RetentionString returns a human-readable string representation of the
+// retention policy.
+func (l LogConfig) RetentionString() string {
+	str := "["
+	prefix := ""
+	if l.RetentionMaxMessages != 0 {
+		str += fmt.Sprintf("Messages: %s", humanize.Comma(l.RetentionMaxMessages))
+		prefix = ", "
+	}
+	if l.RetentionMaxBytes != 0 {
+		str += fmt.Sprintf("%sSize: %s", prefix, humanize.IBytes(uint64(l.RetentionMaxBytes)))
+		prefix = ", "
+	}
+	if l.RetentionMaxAge > 0 {
+		str += fmt.Sprintf("%sAge: %s", prefix, durafmt.Parse(l.RetentionMaxAge))
+		prefix = ", "
+	}
+	if prefix == "" {
+		str += "no limits"
+	}
+	str += fmt.Sprintf(", Compact: %t", l.Compact)
+	str += "]"
+	return str
 }
 
 // ClusteringConfig contains settings for controlling cluster behavior.
@@ -48,24 +87,32 @@ type ClusteringConfig struct {
 	RaftSnapshots           int
 	RaftSnapshotThreshold   uint64
 	RaftCacheSize           int
-	RaftBootstrap           bool
+	RaftBootstrapSeed       bool
 	RaftBootstrapPeers      []string
 	RaftLogging             bool
 	ReplicaMaxLagTime       time.Duration
 	ReplicaMaxLeaderTimeout time.Duration
 	ReplicaFetchTimeout     time.Duration
+	ReplicaMaxIdleWait      time.Duration
+	MinISR                  int
 }
 
 // Config contains all settings for a Liftbridge Server.
 type Config struct {
+	Listen              HostPort
 	Host                string
 	Port                int
 	LogLevel            uint32
-	NoLog               bool
+	LogRecovery         bool
+	LogSilent           bool
 	DataDir             string
 	BatchMaxMessages    int
 	BatchWaitTime       time.Duration
 	MetadataCacheMaxAge time.Duration
+	TLSKey              string
+	TLSCert             string
+	TLSClientAuth       bool
+	TLSClientAuthCA     string
 	NATS                nats.Options
 	Log                 LogConfig
 	Clustering          ClusteringConfig
@@ -84,11 +131,54 @@ func NewDefaultConfig() *Config {
 	config.Clustering.Namespace = DefaultNamespace
 	config.Clustering.ReplicaMaxLagTime = defaultReplicaMaxLagTime
 	config.Clustering.ReplicaMaxLeaderTimeout = defaultReplicaMaxLeaderTimeout
+	config.Clustering.ReplicaMaxIdleWait = defaultReplicaMaxIdleWait
 	config.Clustering.ReplicaFetchTimeout = defaultReplicaFetchTimeout
 	config.Clustering.RaftSnapshots = defaultRaftSnapshots
 	config.Clustering.RaftCacheSize = defaultRaftCacheSize
-	config.Log.RetentionMaxBytes = defaultRetentionMaxBytes
+	config.Clustering.MinISR = defaultMinInsyncReplicas
+	config.Log.SegmentMaxBytes = defaultMaxSegmentBytes
+	config.Log.RetentionMaxAge = defaultRetentionMaxAge
+	config.Log.LogRollTime = defaultLogRollTime
+	config.Log.CleanerInterval = defaultCleanerInterval
 	return config
+}
+
+// GetListenAddress returns the address and port to listen to.
+func (c Config) GetListenAddress() HostPort {
+	if len(c.Listen.Host) > 0 {
+		return c.Listen
+	}
+
+	if len(c.Host) > 0 {
+		return HostPort{
+			Host: c.Host,
+			Port: c.Port,
+		}
+	}
+
+	return HostPort{
+		Host: defaultListenAddress,
+		Port: c.Port,
+	}
+}
+
+// GetConnectionAddress returns the host if specified and listen otherwise.
+func (c Config) GetConnectionAddress() HostPort {
+	if len(c.Host) > 0 {
+		return HostPort{
+			Host: c.Host,
+			Port: c.Port,
+		}
+	}
+
+	if len(c.Listen.Host) > 0 {
+		return c.Listen
+	}
+
+	return HostPort{
+		Host: defaultConnectionAddress,
+		Port: c.Port,
+	}
 }
 
 // GetLogLevel converts the level string to its corresponding int value. It
@@ -112,7 +202,7 @@ func GetLogLevel(level string) (uint32, error) {
 
 // NewConfig creates a new Config with default settings and applies any
 // settings from the given configuration file.
-func NewConfig(configFile string) (*Config, error) {
+func NewConfig(configFile string) (*Config, error) { // nolint: gocyclo
 	config := NewDefaultConfig()
 
 	if configFile == "" {
@@ -123,6 +213,9 @@ func NewConfig(configFile string) (*Config, error) {
 		return nil, err
 	}
 
+	// Reset LogRollTime since this will get overwritten later.
+	config.Log.LogRollTime = 0
+
 	for k, v := range c {
 		switch strings.ToLower(k) {
 		case "listen":
@@ -130,8 +223,8 @@ func NewConfig(configFile string) (*Config, error) {
 			if err != nil {
 				return nil, err
 			}
-			config.Host = hp.host
-			config.Port = hp.port
+
+			config.Listen = *hp
 		case "port":
 			config.Port = int(v.(int64))
 		case "host":
@@ -142,6 +235,8 @@ func NewConfig(configFile string) (*Config, error) {
 				return nil, err
 			}
 			config.LogLevel = level
+		case "log.recovery":
+			config.LogRecovery = v.(bool)
 		case "data.dir":
 			config.DataDir = v.(string)
 		case "batch.max.messages":
@@ -158,8 +253,16 @@ func NewConfig(configFile string) (*Config, error) {
 				return nil, err
 			}
 			config.MetadataCacheMaxAge = dur
+		case "tls.key":
+			config.TLSKey = v.(string)
+		case "tls.cert":
+			config.TLSCert = v.(string)
+		case "tls.client.auth":
+			config.TLSClientAuth = v.(bool)
+		case "tls.client.auth.ca":
+			config.TLSClientAuthCA = v.(string)
 		case "nats":
-			if err := parseNATSConfig(v.(map[string]interface{}), config.NATS); err != nil {
+			if err := parseNATSConfig(v.(map[string]interface{}), &config.NATS); err != nil {
 				return nil, err
 			}
 		case "log":
@@ -174,12 +277,18 @@ func NewConfig(configFile string) (*Config, error) {
 			return nil, fmt.Errorf("Unknown configuration setting %q", k)
 		}
 	}
+
+	// If LogRollTime is not set, default it to the retention time.
+	if config.Log.LogRollTime == 0 {
+		config.Log.LogRollTime = config.Log.RetentionMaxAge
+	}
+
 	return config, nil
 }
 
 // parseNATSConfig parses the `nats` section of a config file and populates the
 // given nats.Options.
-func parseNATSConfig(m map[string]interface{}, opts nats.Options) error {
+func parseNATSConfig(m map[string]interface{}, opts *nats.Options) error {
 	for k, v := range m {
 		switch strings.ToLower(k) {
 		case "servers":
@@ -188,6 +297,12 @@ func parseNATSConfig(m map[string]interface{}, opts nats.Options) error {
 			for i, p := range servers {
 				opts.Servers[i] = p.(string)
 			}
+		case "user":
+			user := v.(string)
+			opts.User = user
+		case "password":
+			password := v.(string)
+			opts.Password = password
 		default:
 			return fmt.Errorf("Unknown nats configuration setting %q", k)
 		}
@@ -202,8 +317,32 @@ func parseLogConfig(config *Config, m map[string]interface{}) error {
 		switch strings.ToLower(k) {
 		case "retention.max.bytes":
 			config.Log.RetentionMaxBytes = v.(int64)
+		case "retention.max.messages":
+			config.Log.RetentionMaxMessages = v.(int64)
+		case "retention.max.age":
+			dur, err := time.ParseDuration(v.(string))
+			if err != nil {
+				return err
+			}
+			config.Log.RetentionMaxAge = dur
+		case "cleaner.interval":
+			dur, err := time.ParseDuration(v.(string))
+			if err != nil {
+				return err
+			}
+			config.Log.CleanerInterval = dur
 		case "segment.max.bytes":
 			config.Log.SegmentMaxBytes = v.(int64)
+		case "log.roll.time":
+			dur, err := time.ParseDuration(v.(string))
+			if err != nil {
+				return err
+			}
+			config.Log.LogRollTime = dur
+		case "compact":
+			config.Log.Compact = v.(bool)
+		case "compact.max.goroutines":
+			config.Log.CompactMaxGoroutines = int(v.(int64))
 		default:
 			return fmt.Errorf("Unknown log configuration setting %q", k)
 		}
@@ -213,7 +352,7 @@ func parseLogConfig(config *Config, m map[string]interface{}) error {
 
 // parseClusteringConfig parses the `clustering` section of a config file and
 // populates the given Config.
-func parseClusteringConfig(config *Config, m map[string]interface{}) error {
+func parseClusteringConfig(config *Config, m map[string]interface{}) error { // nolint: gocyclo
 	for k, v := range m {
 		switch strings.ToLower(k) {
 		case "server.id":
@@ -227,7 +366,7 @@ func parseClusteringConfig(config *Config, m map[string]interface{}) error {
 		case "raft.cache.size":
 			config.Clustering.RaftCacheSize = int(v.(int64))
 		case "raft.bootstrap.seed":
-			config.Clustering.RaftBootstrap = v.(bool)
+			config.Clustering.RaftBootstrapSeed = v.(bool)
 		case "raft.bootstrap.peers":
 			peers := v.([]interface{})
 			config.Clustering.RaftBootstrapPeers = make([]string, len(peers))
@@ -242,12 +381,26 @@ func parseClusteringConfig(config *Config, m map[string]interface{}) error {
 				return err
 			}
 			config.Clustering.ReplicaMaxLagTime = dur
+		case "replica.max.leader.timeout":
+			dur, err := time.ParseDuration(v.(string))
+			if err != nil {
+				return err
+			}
+			config.Clustering.ReplicaMaxLeaderTimeout = dur
+		case "replica.max.idle.wait":
+			dur, err := time.ParseDuration(v.(string))
+			if err != nil {
+				return err
+			}
+			config.Clustering.ReplicaMaxIdleWait = dur
 		case "replica.fetch.timeout":
 			dur, err := time.ParseDuration(v.(string))
 			if err != nil {
 				return err
 			}
 			config.Clustering.ReplicaFetchTimeout = dur
+		case "min.insync.replicas":
+			config.Clustering.MinISR = int(v.(int64))
 		default:
 			return fmt.Errorf("Unknown clustering configuration setting %q", k)
 		}
@@ -255,29 +408,29 @@ func parseClusteringConfig(config *Config, m map[string]interface{}) error {
 	return nil
 }
 
-// hostPort is simple struct to hold parsed listen/addr strings.
-type hostPort struct {
-	host string
-	port int
+// HostPort is simple struct to hold parsed listen/addr strings.
+type HostPort struct {
+	Host string
+	Port int
 }
 
 // parseListen will parse the `listen` option containing the host and port.
-func parseListen(v interface{}) (*hostPort, error) {
-	hp := &hostPort{}
-	switch v.(type) {
+func parseListen(v interface{}) (*HostPort, error) {
+	hp := &HostPort{}
+	switch v := v.(type) {
 	// Only a port
 	case int64:
-		hp.port = int(v.(int64))
+		hp.Port = int(v)
 	case string:
-		host, port, err := net.SplitHostPort(v.(string))
+		host, port, err := net.SplitHostPort(v)
 		if err != nil {
 			return nil, fmt.Errorf("Could not parse address string %q", v)
 		}
-		hp.port, err = strconv.Atoi(port)
+		hp.Port, err = strconv.Atoi(port)
 		if err != nil {
 			return nil, fmt.Errorf("Could not parse port %q", port)
 		}
-		hp.host = host
+		hp.Host = host
 	}
 	return hp, nil
 }

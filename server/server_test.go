@@ -1,17 +1,25 @@
 package server
 
 import (
+	"context"
 	"fmt"
 	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
-	natsdTest "github.com/nats-io/gnatsd/test"
+	lift "github.com/liftbridge-io/go-liftbridge"
+	natsdTest "github.com/nats-io/nats-server/v2/test"
 	log "github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/health/grpc_health_v1"
+
+	proto "github.com/liftbridge-io/liftbridge-api/go"
+	internal "github.com/liftbridge-io/liftbridge/server/proto"
 )
 
 var storagePath string
@@ -34,13 +42,14 @@ func cleanupStorage(t *testing.T) {
 
 func getTestConfig(id string, bootstrap bool, port int) *Config {
 	config := NewDefaultConfig()
-	config.Clustering.RaftBootstrap = bootstrap
+	config.Clustering.RaftBootstrapSeed = bootstrap
 	config.DataDir = filepath.Join(storagePath, id)
 	config.Clustering.RaftSnapshots = 1
 	config.Clustering.RaftLogging = true
+	config.Clustering.ServerID = id
 	config.LogLevel = uint32(log.DebugLevel)
 	config.NATS.Servers = []string{"nats://localhost:4222"}
-	config.NoLog = true
+	config.LogSilent = true
 	config.Port = port
 	return config
 }
@@ -58,10 +67,10 @@ func getMetadataLeader(t *testing.T, timeout time.Duration, servers ...*Server) 
 	)
 	for time.Now().Before(deadline) {
 		for _, s := range servers {
-			if !s.isRunning() || s.raft == nil {
+			if !s.IsRunning() || s.getRaft() == nil {
 				continue
 			}
-			if s.isLeader() {
+			if s.IsLeader() {
 				if leader != nil {
 					stackFatalf(t, "Found more than one metadata leader")
 				}
@@ -79,21 +88,39 @@ func getMetadataLeader(t *testing.T, timeout time.Duration, servers ...*Server) 
 	return leader
 }
 
-func getStreamLeader(t *testing.T, timeout time.Duration, subject, name string, servers ...*Server) *Server {
+func waitForNoMetadataLeader(t *testing.T, timeout time.Duration, servers ...*Server) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		var leader string
+		for _, s := range servers {
+			if l := string(s.getRaft().Leader()); l != "" {
+				leader = l
+				break
+			}
+		}
+		if leader == "" {
+			return
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	stackFatalf(t, "Metadata leader found")
+}
+
+func getPartitionLeader(t *testing.T, timeout time.Duration, name string, partitionID int32, servers ...*Server) *Server {
 	var (
 		leader   *Server
 		deadline = time.Now().Add(timeout)
 	)
 	for time.Now().Before(deadline) {
 		for _, s := range servers {
-			if !s.isRunning() {
+			if !s.IsRunning() {
 				continue
 			}
-			stream := s.metadata.GetStream(subject, name)
-			if stream == nil {
+			partition := s.metadata.GetPartition(name, partitionID)
+			if partition == nil {
 				continue
 			}
-			streamLeader, _ := stream.GetLeader()
+			streamLeader, _ := partition.GetLeader()
 			if streamLeader == s.config.Clustering.ServerID {
 				if leader != nil {
 					stackFatalf(t, "Found more than one stream leader")
@@ -110,6 +137,16 @@ func getStreamLeader(t *testing.T, timeout time.Duration, subject, name string, 
 		stackFatalf(t, "No stream leader found")
 	}
 	return leader
+}
+
+func forceLogClean(t *testing.T, subject, name string, s *Server) {
+	partition := s.metadata.GetPartition(name, 0)
+	if partition == nil {
+		stackFatalf(t, "Stream not found")
+	}
+	if err := partition.log.Clean(); err != nil {
+		stackFatalf(t, "Log clean failed: %s", err)
+	}
 }
 
 // Ensure starting a node fails when there is no seed node to join and no
@@ -150,7 +187,7 @@ func TestAssignedDurableServerID(t *testing.T) {
 	// Wait to elect self as leader.
 	leader := getMetadataLeader(t, 10*time.Second, s1)
 
-	future := leader.raft.GetConfiguration()
+	future := leader.getRaft().GetConfiguration()
 	if err := future.Error(); err != nil {
 		t.Fatalf("Unexpected error on GetConfiguration: %v", err)
 	}
@@ -169,7 +206,7 @@ func TestAssignedDurableServerID(t *testing.T) {
 	// Wait to elect self as leader.
 	leader = getMetadataLeader(t, 10*time.Second, s1)
 
-	future = leader.raft.GetConfiguration()
+	future = leader.getRaft().GetConfiguration()
 	if err := future.Error(); err != nil {
 		t.Fatalf("Unexpected error on GetConfiguration: %v", err)
 	}
@@ -196,7 +233,7 @@ func TestDurableServerID(t *testing.T) {
 	// Wait to elect self as leader.
 	leader := getMetadataLeader(t, 10*time.Second, s1)
 
-	future := leader.raft.GetConfiguration()
+	future := leader.getRaft().GetConfiguration()
 	if err := future.Error(); err != nil {
 		t.Fatalf("Unexpected error on GetConfiguration: %v", err)
 	}
@@ -215,13 +252,41 @@ func TestDurableServerID(t *testing.T) {
 	// Wait to elect self as leader.
 	leader = getMetadataLeader(t, 10*time.Second, s1)
 
-	future = leader.raft.GetConfiguration()
+	future = leader.getRaft().GetConfiguration()
 	if err := future.Error(); err != nil {
 		t.Fatalf("Unexpected error on GetConfiguration: %v", err)
 	}
 	newID := future.Configuration().Servers[0].ID
 	if newID != "a" {
 		t.Fatalf("Incorrect cluster server id, expected: a, got: %s", newID)
+	}
+}
+
+// Ensure server starts the gRPC health service correctly.
+func TestHealthServerStartedCorrectly(t *testing.T) {
+	defer cleanupStorage(t)
+
+	// Use a central NATS server.
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	// Configure the first server as a seed.
+	s1Config := getTestConfig("a", true, 20000)
+	s1 := runServerWithConfig(t, s1Config)
+	defer s1.Stop()
+
+	// Configure second server which should automatically join the first.
+	s2Config := getTestConfig("b", false, 20001)
+	s2 := runServerWithConfig(t, s2Config)
+	defer s2.Stop()
+
+	conn, err := grpc.Dial("127.0.0.1:20000", []grpc.DialOption{grpc.WithInsecure()}...)
+	require.NoError(t, err)
+	healthClient := grpc_health_v1.NewHealthClient(conn)
+	healthCheckReply, err := healthClient.Check(context.Background(), &grpc_health_v1.HealthCheckRequest{Service: "proto.API"})
+	require.NoError(t, err)
+	if healthCheckReply.Status != grpc_health_v1.HealthCheckResponse_SERVING {
+		t.Fatalf("API service is not healthy when it should be: %v", err)
 	}
 }
 
@@ -250,7 +315,7 @@ func TestBootstrapAutoConfig(t *testing.T) {
 	)
 
 	// Verify configuration.
-	future := leader.raft.GetConfiguration()
+	future := leader.getRaft().GetConfiguration()
 	if err := future.Error(); err != nil {
 		t.Fatalf("Unexpected error on GetConfiguration: %v", err)
 	}
@@ -289,7 +354,7 @@ func TestBootstrapManualConfig(t *testing.T) {
 	)
 
 	// Verify configuration.
-	future := leader.raft.GetConfiguration()
+	future := leader.getRaft().GetConfiguration()
 	if err := future.Error(); err != nil {
 		t.Fatalf("Unexpected error on GetConfiguration: %v", err)
 	}
@@ -303,7 +368,7 @@ func TestBootstrapManualConfig(t *testing.T) {
 	s3 := runServerWithConfig(t, s3Config)
 	defer s3.Stop()
 
-	future = leader.raft.GetConfiguration()
+	future = leader.getRaft().GetConfiguration()
 	if err := future.Error(); err != nil {
 		t.Fatalf("Unexpected error on GetConfiguration: %v", err)
 	}
@@ -415,4 +480,844 @@ func TestMetadataLeaderFailover(t *testing.T) {
 
 	// Wait for new leader to be elected.
 	getMetadataLeader(t, 10*time.Second, followers...)
+}
+
+// Ensure when the subscribe offset exceeds the HW, the subscription waits for
+// new messages.
+func TestSubscribeOffsetOverflow(t *testing.T) {
+	defer cleanupStorage(t)
+
+	// Use a central NATS server.
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	// Configure server.
+	s1Config := getTestConfig("a", true, 5050)
+	s1 := runServerWithConfig(t, s1Config)
+	defer s1.Stop()
+
+	// Wait for server to elect itself leader.
+	getMetadataLeader(t, 10*time.Second, s1)
+
+	client, err := lift.Connect([]string{"localhost:5050"})
+	require.NoError(t, err)
+	defer client.Close()
+
+	// Create stream.
+	name := "foo"
+	subject := "foo"
+	err = client.CreateStream(context.Background(), subject, name)
+	require.NoError(t, err)
+
+	// Publish some messages.
+	num := 5
+	for i := 0; i < num; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, err = client.Publish(ctx, subject, []byte("hello"))
+		require.NoError(t, err)
+	}
+
+	// Subscribe with overflowed offset. This should wait for new messages
+	// starting at offset 5.
+	gotMsg := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	err = client.Subscribe(ctx, name, func(msg *proto.Message, err error) {
+		require.NoError(t, err)
+		require.Equal(t, int64(5), msg.Offset)
+		close(gotMsg)
+		cancel()
+	}, lift.StartAtOffset(100))
+	require.NoError(t, err)
+
+	// Publish one more message.
+	_, err = client.Publish(context.Background(), subject, []byte("test"))
+	require.NoError(t, err)
+
+	// Wait to get the new message.
+	select {
+	case <-gotMsg:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Did not receive expected message")
+	}
+}
+
+// Ensure when the subscribe offset exceeds the HW due to the stream being
+// empty, the subscription waits for new messages.
+func TestSubscribeOffsetOverflowEmptyStream(t *testing.T) {
+	defer cleanupStorage(t)
+
+	// Use a central NATS server.
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	// Configure server.
+	s1Config := getTestConfig("a", true, 5050)
+	s1 := runServerWithConfig(t, s1Config)
+	defer s1.Stop()
+
+	// Wait for server to elect itself leader.
+	getMetadataLeader(t, 10*time.Second, s1)
+
+	client, err := lift.Connect([]string{"localhost:5050"})
+	require.NoError(t, err)
+	defer client.Close()
+
+	// Create stream.
+	name := "foo"
+	subject := "foo"
+	err = client.CreateStream(context.Background(), subject, name)
+	require.NoError(t, err)
+
+	// Subscribe with overflowed offset. This should wait for new messages
+	// starting at offset 0.
+	gotMsg := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	err = client.Subscribe(ctx, name, func(msg *proto.Message, err error) {
+		require.NoError(t, err)
+		require.Equal(t, int64(0), msg.Offset)
+		close(gotMsg)
+		cancel()
+	})
+	require.NoError(t, err)
+
+	// Publish message.
+	_, err = client.Publish(context.Background(), subject, []byte("test"))
+	require.NoError(t, err)
+
+	// Wait to get the message.
+	select {
+	case <-gotMsg:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Did not receive expected message")
+	}
+}
+
+// Ensure when the subscribe offset is less than the oldest log offset, the
+// offset is set to the oldest offset.
+func TestSubscribeOffsetUnderflow(t *testing.T) {
+	defer cleanupStorage(t)
+
+	// Use a central NATS server.
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	// Configure server.
+	s1Config := getTestConfig("a", true, 5050)
+	// Set these to force deletion so we can get an underflow.
+	s1Config.Log.SegmentMaxBytes = 1
+	s1Config.Log.RetentionMaxBytes = 1
+	s1Config.BatchMaxMessages = 1
+	s1 := runServerWithConfig(t, s1Config)
+	defer s1.Stop()
+
+	// Wait for server to elect itself leader.
+	getMetadataLeader(t, 10*time.Second, s1)
+
+	client, err := lift.Connect([]string{"localhost:5050"})
+	require.NoError(t, err)
+	defer client.Close()
+
+	// Create stream.
+	name := "foo"
+	subject := "foo"
+	err = client.CreateStream(context.Background(), subject, name)
+	require.NoError(t, err)
+
+	// Publish some messages.
+	num := 2
+	for i := 0; i < num; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, err = client.Publish(ctx, subject, []byte("hello"))
+		require.NoError(t, err)
+	}
+
+	// Force log clean.
+	forceLogClean(t, subject, name, s1)
+
+	// Subscribe with underflowed offset. This should set the offset to 1.
+	gotMsg := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	err = client.Subscribe(ctx, name, func(msg *proto.Message, err error) {
+		require.NoError(t, err)
+		require.Equal(t, int64(1), msg.Offset)
+		close(gotMsg)
+		cancel()
+	}, lift.StartAtOffset(0))
+	require.NoError(t, err)
+
+	// Wait to get the new message.
+	select {
+	case <-gotMsg:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Did not receive expected message")
+	}
+}
+
+// Ensure the stream bytes retention ensures data is deleted when the log
+// exceeds the limit.
+func TestStreamRetentionBytes(t *testing.T) {
+	defer cleanupStorage(t)
+
+	// Use a central NATS server.
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	// Configure server.
+	s1Config := getTestConfig("a", true, 5050)
+	s1Config.Log.SegmentMaxBytes = 1
+	s1Config.Log.RetentionMaxBytes = 1000
+	s1Config.BatchMaxMessages = 1
+	s1 := runServerWithConfig(t, s1Config)
+	defer s1.Stop()
+
+	// Wait for server to elect itself leader.
+	getMetadataLeader(t, 10*time.Second, s1)
+
+	client, err := lift.Connect([]string{"localhost:5050"})
+	require.NoError(t, err)
+	defer client.Close()
+
+	// Create stream.
+	name := "foo"
+	subject := "foo"
+	err = client.CreateStream(context.Background(), subject, name)
+	require.NoError(t, err)
+
+	// Publish some messages.
+	num := 100
+	for i := 0; i < num; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, err = client.Publish(ctx, subject, []byte("hello"))
+		require.NoError(t, err)
+	}
+
+	// Force log clean.
+	forceLogClean(t, subject, name, s1)
+
+	// The first message read back should have offset 87.
+	msgs := make(chan *proto.Message, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	err = client.Subscribe(ctx, name, func(msg *proto.Message, err error) {
+		require.NoError(t, err)
+		msgs <- msg
+		cancel()
+	}, lift.StartAtEarliestReceived())
+	require.NoError(t, err)
+
+	// Wait to get the new message.
+	select {
+	case msg := <-msgs:
+		require.Equal(t, int64(87), msg.Offset)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Did not receive expected message")
+	}
+}
+
+// Ensure the stream messages retention ensures data is deleted when the log
+// exceeds the limit.
+func TestStreamRetentionMessages(t *testing.T) {
+	defer cleanupStorage(t)
+
+	// Use a central NATS server.
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	// Configure server.
+	s1Config := getTestConfig("a", true, 5050)
+	s1Config.Log.SegmentMaxBytes = 1
+	s1Config.Log.RetentionMaxMessages = 5
+	s1Config.BatchMaxMessages = 1
+	s1 := runServerWithConfig(t, s1Config)
+	defer s1.Stop()
+
+	// Wait for server to elect itself leader.
+	getMetadataLeader(t, 10*time.Second, s1)
+
+	client, err := lift.Connect([]string{"localhost:5050"})
+	require.NoError(t, err)
+	defer client.Close()
+
+	// Create stream.
+	name := "foo"
+	subject := "foo"
+	err = client.CreateStream(context.Background(), subject, name)
+	require.NoError(t, err)
+
+	// Publish some messages.
+	num := 10
+	for i := 0; i < num; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, err = client.Publish(ctx, subject, []byte("hello"))
+		require.NoError(t, err)
+	}
+
+	// Force log clean.
+	forceLogClean(t, subject, name, s1)
+
+	// The first message read back should have offset 5.
+	msgs := make(chan *proto.Message, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	err = client.Subscribe(ctx, name, func(msg *proto.Message, err error) {
+		require.NoError(t, err)
+		msgs <- msg
+		cancel()
+	}, lift.StartAtEarliestReceived())
+	require.NoError(t, err)
+
+	// Wait to get the new message.
+	select {
+	case msg := <-msgs:
+		require.Equal(t, int64(5), msg.Offset)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Did not receive expected message")
+	}
+}
+
+// Ensure the stream message age retention ensures data is deleted when log
+// segments exceed the TTL.
+func TestStreamRetentionAge(t *testing.T) {
+	defer cleanupStorage(t)
+
+	// Use a central NATS server.
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	// Configure server.
+	s1Config := getTestConfig("a", true, 5050)
+	s1Config.Log.SegmentMaxBytes = 1
+	s1Config.Log.RetentionMaxAge = time.Nanosecond
+	s1Config.BatchMaxMessages = 1
+	s1 := runServerWithConfig(t, s1Config)
+	defer s1.Stop()
+
+	// Wait for server to elect itself leader.
+	getMetadataLeader(t, 10*time.Second, s1)
+
+	client, err := lift.Connect([]string{"localhost:5050"})
+	require.NoError(t, err)
+	defer client.Close()
+
+	// Create stream.
+	name := "foo"
+	subject := "foo"
+	err = client.CreateStream(context.Background(), subject, name)
+	require.NoError(t, err)
+
+	// Publish some messages.
+	num := 100
+	for i := 0; i < num; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, err = client.Publish(ctx, subject, []byte("hello"))
+		require.NoError(t, err)
+	}
+
+	// Force log clean.
+	forceLogClean(t, subject, name, s1)
+
+	// We expect all segments but the last to be truncated due to age, so the
+	// first message read back should have offset 99.
+	msgs := make(chan *proto.Message, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	err = client.Subscribe(ctx, name, func(msg *proto.Message, err error) {
+		require.NoError(t, err)
+		msgs <- msg
+		cancel()
+	}, lift.StartAtEarliestReceived())
+	require.NoError(t, err)
+
+	// Wait to get the new message.
+	select {
+	case msg := <-msgs:
+		require.Equal(t, int64(99), msg.Offset)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Did not receive expected message")
+	}
+}
+
+// Ensure when StartPosition_EARLIEST is used with Subscribe, messages are read
+// starting at the oldest offset.
+func TestSubscribeEarliest(t *testing.T) {
+	defer cleanupStorage(t)
+
+	// Use a central NATS server.
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	// Configure server.
+	s1Config := getTestConfig("a", true, 5050)
+	// Set these to force deletion.
+	s1Config.Log.SegmentMaxBytes = 1
+	s1Config.Log.RetentionMaxBytes = 1
+	s1Config.BatchMaxMessages = 1
+	s1 := runServerWithConfig(t, s1Config)
+	defer s1.Stop()
+
+	// Wait for server to elect itself leader.
+	getMetadataLeader(t, 10*time.Second, s1)
+
+	client, err := lift.Connect([]string{"localhost:5050"})
+	require.NoError(t, err)
+	defer client.Close()
+
+	// Create stream.
+	name := "foo"
+	subject := "foo"
+	err = client.CreateStream(context.Background(), subject, name)
+	require.NoError(t, err)
+
+	// Publish some messages.
+	num := 2
+	for i := 0; i < num; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, err = client.Publish(ctx, subject, []byte("hello"))
+		require.NoError(t, err)
+	}
+
+	// Force log clean.
+	forceLogClean(t, subject, name, s1)
+
+	// Subscribe with EARLIEST. This should start reading from offset 1.
+	gotMsg := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	client.Subscribe(ctx, name, func(msg *proto.Message, err error) {
+		require.NoError(t, err)
+		require.Equal(t, int64(1), msg.Offset)
+		close(gotMsg)
+		cancel()
+	}, lift.StartAtEarliestReceived())
+
+	// Wait to get the new message.
+	select {
+	case <-gotMsg:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Did not receive expected message")
+	}
+}
+
+// Ensure when StartPosition_LATEST is used with Subscribe, messages are read
+// starting at the newest offset.
+func TestSubscribeLatest(t *testing.T) {
+	defer cleanupStorage(t)
+
+	// Use a central NATS server.
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	// Configure server.
+	s1Config := getTestConfig("a", true, 5050)
+	s1 := runServerWithConfig(t, s1Config)
+	defer s1.Stop()
+
+	// Wait for server to elect itself leader.
+	getMetadataLeader(t, 10*time.Second, s1)
+
+	client, err := lift.Connect([]string{"localhost:5050"})
+	require.NoError(t, err)
+	defer client.Close()
+
+	// Create stream.
+	name := "foo"
+	subject := "foo"
+	err = client.CreateStream(context.Background(), subject, name)
+	require.NoError(t, err)
+
+	// Publish some messages.
+	num := 3
+	for i := 0; i < num; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, err = client.Publish(ctx, subject, []byte("hello"))
+		require.NoError(t, err)
+	}
+
+	// Subscribe with LATEST. This should start reading from offset 2.
+	gotMsg := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	client.Subscribe(ctx, name, func(msg *proto.Message, err error) {
+		require.NoError(t, err)
+		require.Equal(t, int64(2), msg.Offset)
+		close(gotMsg)
+		cancel()
+	}, lift.StartAtLatestReceived())
+
+	// Wait to get the new message.
+	select {
+	case <-gotMsg:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Did not receive expected message")
+	}
+}
+
+// Ensure when StartPosition_NEW_ONLY is used with Subscribe, the subscription
+// waits for new messages.
+func TestSubscribeNewOnly(t *testing.T) {
+	defer cleanupStorage(t)
+
+	// Use a central NATS server.
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	// Configure server.
+	s1Config := getTestConfig("a", true, 5050)
+	s1 := runServerWithConfig(t, s1Config)
+	defer s1.Stop()
+
+	// Wait for server to elect itself leader.
+	getMetadataLeader(t, 10*time.Second, s1)
+
+	client, err := lift.Connect([]string{"localhost:5050"})
+	require.NoError(t, err)
+	defer client.Close()
+
+	// Create stream.
+	name := "foo"
+	subject := "foo"
+	err = client.CreateStream(context.Background(), subject, name)
+	require.NoError(t, err)
+
+	// Publish some messages.
+	num := 5
+	for i := 0; i < num; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, err = client.Publish(ctx, subject, []byte("hello"))
+		require.NoError(t, err)
+	}
+
+	// Subscribe with NEW_ONLY. This should wait for new messages starting at
+	// offset 5.
+	gotMsg := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	err = client.Subscribe(ctx, name, func(msg *proto.Message, err error) {
+		require.NoError(t, err)
+		require.Equal(t, int64(5), msg.Offset)
+		close(gotMsg)
+		cancel()
+	})
+	require.NoError(t, err)
+
+	// Publish one more message.
+	_, err = client.Publish(context.Background(), subject, []byte("test"))
+	require.NoError(t, err)
+
+	// Wait to get the new message.
+	select {
+	case <-gotMsg:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Did not receive expected message")
+	}
+}
+
+// Ensure when StartPosition_TIMESTAMP is used with Subscribe, messages are
+// read starting at the given timestamp.
+func TestSubscribeStartTime(t *testing.T) {
+	defer cleanupStorage(t)
+	timestampBefore := timestamp
+	mockTimestamp := int64(0)
+	timestamp = func() int64 {
+		time := mockTimestamp
+		mockTimestamp += 10
+		return time
+	}
+	defer func() {
+		timestamp = timestampBefore
+	}()
+
+	// Use a central NATS server.
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	// Configure server.
+	s1Config := getTestConfig("a", true, 5050)
+	s1 := runServerWithConfig(t, s1Config)
+	defer s1.Stop()
+
+	// Wait for server to elect itself leader.
+	getMetadataLeader(t, 10*time.Second, s1)
+
+	client, err := lift.Connect([]string{"localhost:5050"})
+	require.NoError(t, err)
+	defer client.Close()
+
+	// Create stream.
+	name := "foo"
+	subject := "foo"
+	err = client.CreateStream(context.Background(), subject, name)
+	require.NoError(t, err)
+
+	// Publish some messages.
+	num := 5
+	for i := 0; i < num; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, err = client.Publish(ctx, subject, []byte("hello"))
+		require.NoError(t, err)
+	}
+
+	// Subscribe with TIMESTAMP 25. This should start reading from offset 3.
+	gotMsg := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	client.Subscribe(ctx, name, func(msg *proto.Message, err error) {
+		select {
+		case <-gotMsg:
+			return
+		default:
+		}
+		require.NoError(t, err)
+		require.Equal(t, int64(3), msg.Offset)
+		require.Equal(t, int64(30), msg.Timestamp)
+		close(gotMsg)
+		cancel()
+	}, lift.StartAtTime(time.Unix(0, 25)))
+
+	// Wait to get the new message.
+	select {
+	case <-gotMsg:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Did not receive expected message")
+	}
+}
+
+// Ensure clients can connect with TLS when enabled.
+func TestTLS(t *testing.T) {
+	defer cleanupStorage(t)
+
+	// Use a central NATS server.
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	// Configure server with TLS.
+	s1Config, err := NewConfig("./configs/tls.conf")
+	require.NoError(t, err)
+	s1 := runServerWithConfig(t, s1Config)
+	defer s1.Stop()
+
+	// Wait for server to elect itself leader.
+	getMetadataLeader(t, 10*time.Second, s1)
+
+	// Connect with TLS.
+	client, err := lift.Connect([]string{"localhost:5050"}, lift.TLSCert("./configs/certs/server.crt"))
+	require.NoError(t, err)
+	defer client.Close()
+
+	// Connecting without a cert should fail.
+	_, err = lift.Connect([]string{"localhost:5050"})
+	require.Error(t, err)
+}
+
+// Ensure that the host address is the same as the listen address when
+// specifying only the latter
+func TestListen(t *testing.T) {
+	config, err := NewConfig("./configs/listen.conf")
+	require.NoError(t, err)
+
+	ex := HostPort{
+		Host: "192.168.0.1",
+		Port: 4222,
+	}
+
+	r := config.GetListenAddress()
+	if r != ex {
+		t.Fatalf("Not Equal:\nReceived: '%+v'\nExpected: '%+v'\n", r, ex)
+	}
+
+	r = config.GetConnectionAddress()
+	if r != ex {
+		t.Fatalf("Not Equal:\nReceived: '%+v'\nExpected: '%+v'\n", r, ex)
+	}
+}
+
+// Ensure that the listen address is the same as the host address when
+// specifying only the latter
+func TestHost(t *testing.T) {
+	config, err := NewConfig("./configs/host.conf")
+	require.NoError(t, err)
+
+	ex := HostPort{
+		Host: "192.168.0.1",
+		Port: 4222,
+	}
+
+	r := config.GetListenAddress()
+	if r != ex {
+		t.Fatalf("Not Equal:\nReceived: '%+v'\nExpected: '%+v'\n", r, ex)
+	}
+
+	r = config.GetConnectionAddress()
+	if r != ex {
+		t.Fatalf("Not Equal:\nReceived: '%+v'\nExpected: '%+v'\n", r, ex)
+	}
+}
+
+// Ensure that the listen and connection addresses have the expected values
+// when specifying both
+func TestListenHost(t *testing.T) {
+	config, err := NewConfig("./configs/listen-host.conf")
+	require.NoError(t, err)
+
+	ex := HostPort{
+		Host: "192.168.0.1",
+		Port: 4222,
+	}
+
+	r := config.GetListenAddress()
+	if r != ex {
+		t.Fatalf("Not Equal:\nReceived: '%+v'\nExpected: '%+v'\n", r, ex)
+	}
+
+	ex = HostPort{
+		Host: "my-host",
+		Port: 4333,
+	}
+
+	r = config.GetConnectionAddress()
+	if r != ex {
+		t.Fatalf("Not Equal:\nReceived: '%+v'\nExpected: '%+v'\n", r, ex)
+	}
+}
+
+// Ensure that the listen and connection addresses have the expected default
+// values
+func TestDefaultListenHost(t *testing.T) {
+	config := NewDefaultConfig()
+
+	ex := HostPort{
+		Host: defaultListenAddress,
+		Port: DefaultPort,
+	}
+
+	r := config.GetListenAddress()
+	if r != ex {
+		t.Fatalf("Not Equal:\nReceived: '%+v'\nExpected: '%+v'\n", r, ex)
+	}
+
+	ex = HostPort{
+		Host: defaultConnectionAddress,
+		Port: DefaultPort,
+	}
+
+	r = config.GetConnectionAddress()
+	if r != ex {
+		t.Fatalf("Not Equal:\nReceived: '%+v'\nExpected: '%+v'\n", r, ex)
+	}
+}
+
+// Ensure the leader flag is set when the server is elected metadata leader and
+// unset when it loses leadership.
+func TestMetadataLeadershipLifecycle(t *testing.T) {
+	defer cleanupStorage(t)
+
+	// Use a central NATS server.
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	// Configure first server.
+	s1Config := getTestConfig("a", true, 0)
+	s1 := runServerWithConfig(t, s1Config)
+	defer s1.Stop()
+
+	// Configure second server.
+	s2Config := getTestConfig("b", false, 0)
+	s2 := runServerWithConfig(t, s2Config)
+	defer s2.Stop()
+
+	// Wait for server to elect itself leader.
+	getMetadataLeader(t, 10*time.Second, s1)
+
+	// Check leader flag is set.
+	require.Equal(t, int64(1), atomic.LoadInt64(&(s1.getRaft().leader)))
+
+	// Kill the follower.
+	s2.Stop()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		leader := atomic.LoadInt64(&(s1.getRaft().leader))
+		if leader == 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+		continue
+	}
+	t.Fatal("Expected leader flag to be 0")
+}
+
+// Ensure propagation handlers for shrinking and expanding the ISR work
+// correctly.
+func TestPropagatedShrinkExpandISR(t *testing.T) {
+	defer cleanupStorage(t)
+
+	// Use a central NATS server.
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	// Configure first server.
+	s1Config := getTestConfig("a", true, 5050)
+	s1 := runServerWithConfig(t, s1Config)
+	defer s1.Stop()
+
+	// Configure second server.
+	s2Config := getTestConfig("b", false, 0)
+	s2 := runServerWithConfig(t, s2Config)
+	defer s2.Stop()
+
+	// Wait for server to elect itself leader.
+	controller := getMetadataLeader(t, 10*time.Second, s1)
+
+	client, err := lift.Connect([]string{"localhost:5050"})
+	require.NoError(t, err)
+	defer client.Close()
+
+	// Create stream.
+	name := "foo"
+	subject := "foo"
+	err = client.CreateStream(context.Background(), subject, name,
+		lift.ReplicationFactor(2))
+	require.NoError(t, err)
+
+	waitForISR(t, 10*time.Second, name, 0, 2, s1, s2)
+
+	leader := getPartitionLeader(t, 10*time.Second, name, 0, s1, s2)
+	followerID := s1.config.Clustering.ServerID
+	if leader == s1 {
+		followerID = s2.config.Clustering.ServerID
+	}
+	partition := leader.metadata.GetPartition(name, 0)
+	require.NotNil(t, partition)
+	leaderEpoch := partition.LeaderEpoch
+
+	// Shrink ISR.
+	controller.handleShrinkISR(&internal.PropagatedRequest{
+		ShrinkISROp: &internal.ShrinkISROp{
+			Stream:          name,
+			Partition:       0,
+			ReplicaToRemove: followerID,
+			Leader:          leader.config.Clustering.ServerID,
+			LeaderEpoch:     leaderEpoch,
+		},
+	})
+
+	// Wait for ISR to shrink.
+	waitForISR(t, 10*time.Second, name, 0, 1, s1, s2)
+
+	// Expand ISR.
+	controller.handleExpandISR(&internal.PropagatedRequest{
+		Op: internal.Op_EXPAND_ISR,
+		ExpandISROp: &internal.ExpandISROp{
+			Stream:       name,
+			Partition:    0,
+			ReplicaToAdd: followerID,
+			Leader:       leader.config.Clustering.ServerID,
+			LeaderEpoch:  leaderEpoch,
+		},
+	})
+
+	// Wait for ISR to expand.
+	waitForISR(t, 10*time.Second, name, 0, 2, s1, s2)
 }

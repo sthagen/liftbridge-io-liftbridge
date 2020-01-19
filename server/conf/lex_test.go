@@ -319,7 +319,7 @@ func TestRawString(t *testing.T) {
 	lx := lex("foo = bar")
 	expect(t, lx, expectedItems)
 
-	lx = lex(`foo = bar' `) //'single-quote for emacs TODO: Remove me
+	lx = lex(`foo = bar' `) // 'single-quote for emacs TODO: Remove me
 	expect(t, lx, expectedItems)
 }
 
