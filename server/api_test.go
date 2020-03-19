@@ -76,14 +76,14 @@ func TestCreateStreamPropagate(t *testing.T) {
 	s2 := runServerWithConfig(t, s2Config)
 	defer s2.Stop()
 
-	getMetadataLeader(t, 10*time.Second, s1, s2)
-
 	// Connect and send the request to the follower.
 	client, err := lift.Connect([]string{"localhost:5050"})
 	require.NoError(t, err)
 	defer client.Close()
 
-	err = client.CreateStream(context.Background(), "foo", "foo")
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	err = client.CreateStream(ctx, "foo", "foo")
 	require.NoError(t, err)
 
 	// Creating the same stream returns ErrStreamExists.
@@ -123,7 +123,7 @@ func TestCreateStreamNoMetadataLeader(t *testing.T) {
 	err = client.CreateStream(context.Background(), "foo", "foo")
 	require.Error(t, err)
 	st := status.Convert(err)
-	require.Equal(t, "No known metadata leader", st.Message())
+	require.Equal(t, "no known metadata leader", st.Message())
 	require.Equal(t, codes.Internal, st.Code())
 }
 
@@ -206,6 +206,44 @@ func TestSubscribeStreamNoSuchStream(t *testing.T) {
 	_, err = stream.Recv()
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "No such partition")
+}
+
+// Ensure getting a deleted stream returns nil.
+func TestDeleteStream(t *testing.T) {
+	defer cleanupStorage(t)
+
+	// Use a central NATS server.
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	// Configure server.
+	s1Config := getTestConfig("a", true, 5050)
+	s1 := runServerWithConfig(t, s1Config)
+	defer s1.Stop()
+
+	getMetadataLeader(t, 10*time.Second, s1)
+
+	client, err := lift.Connect([]string{"localhost:5050"})
+	require.NoError(t, err)
+	defer client.Close()
+
+	err = client.DeleteStream(context.Background(), "foo")
+	require.Error(t, err)
+
+	err = client.CreateStream(context.Background(), "foo", "foo", lift.Partitions(3))
+	require.NoError(t, err)
+
+	stream := s1.metadata.GetStream("foo")
+	require.NotNil(t, stream)
+
+	err = client.DeleteStream(context.Background(), "foo")
+	require.NoError(t, err)
+
+	stream = s1.metadata.GetStream("foo")
+	require.Nil(t, stream)
+
+	err = client.CreateStream(context.Background(), "foo", "foo", lift.Partitions(3))
+	require.NoError(t, err)
 }
 
 // Ensure sending a subscribe request to a server that is not the stream leader
