@@ -12,7 +12,7 @@ import (
 
 	client "github.com/liftbridge-io/liftbridge-api/go"
 	"github.com/liftbridge-io/liftbridge/server/commitlog"
-	"github.com/liftbridge-io/liftbridge/server/proto"
+	proto "github.com/liftbridge-io/liftbridge/server/protocol"
 )
 
 const raftApplyTimeout = 30 * time.Second
@@ -84,6 +84,28 @@ func (a *apiServer) DeleteStream(ctx context.Context, req *client.DeleteStreamRe
 		Stream: req.Name,
 	}); e != nil {
 		a.logger.Errorf("api: Failed to delete stream %v: %v", req.Name, e.Err())
+		return nil, e.Err()
+	}
+
+	return resp, nil
+}
+
+// PauseStream pauses a stream's partitions. If no partitions are specified,
+// all of the stream's partitions will be paused. Partitions are resumed when
+// they are published to via the Liftbridge Publish API.
+func (a *apiServer) PauseStream(ctx context.Context, req *client.PauseStreamRequest) (
+	*client.PauseStreamResponse, error) {
+
+	resp := &client.PauseStreamResponse{}
+	a.logger.Debugf("api: PauseStream [name=%s, partitions=%v, resumeAll=%v]",
+		req.Name, req.Partitions, req.ResumeAll)
+
+	if e := a.metadata.PauseStream(ctx, &proto.PauseStreamOp{
+		Stream:     req.Name,
+		Partitions: req.Partitions,
+		ResumeAll:  req.ResumeAll,
+	}); e != nil {
+		a.logger.Errorf("api: Failed to pause stream %v: %v", req.Name, e.Err())
 		return nil, e.Err()
 	}
 
@@ -167,6 +189,11 @@ func (a *apiServer) Publish(ctx context.Context, req *client.PublishRequest) (
 	}
 	a.logger.Debugf("api: Publish [subject=%s]", subject)
 
+	err = a.resumeStream(ctx, req.Stream, req.Partition)
+	if err != nil {
+		return nil, err
+	}
+
 	if req.AckInbox == "" {
 		req.AckInbox = nuid.Next()
 	}
@@ -208,6 +235,50 @@ func (a *apiServer) Publish(ctx context.Context, req *client.PublishRequest) (
 	return resp, err
 }
 
+func (a *apiServer) resumeStream(ctx context.Context, streamName string, partitionID int32) error {
+	if streamName == "" {
+		return nil
+	}
+	stream := a.metadata.GetStream(streamName)
+	if stream == nil {
+		return status.Error(codes.NotFound, fmt.Sprintf("No such stream: %s", streamName))
+	}
+	if !stream.GetResumeAll() {
+		// Just resume the partition being published to if it's paused.
+		partition := stream.GetPartition(partitionID)
+		if partition == nil {
+			return status.Error(codes.NotFound, fmt.Sprintf("No such partition: %d", partitionID))
+		}
+		if partition.IsPaused() {
+			if e := a.unpausePartition(ctx, partition.Partition); e != nil {
+				a.logger.Errorf("api: Failed to resume stream partition %d: %v", partitionID, e.Err())
+				return e.Err()
+			}
+		}
+		return nil
+	}
+
+	// If ResumeAll is enabled, resume any paused partitions in the stream.
+	for partitionID, partition := range stream.GetPartitions() {
+		// Do not try to resume an unpaused partition.
+		if !partition.IsPaused() {
+			continue
+		}
+		if e := a.unpausePartition(ctx, partition.Partition); e != nil {
+			a.logger.Errorf("api: Failed to resume stream partition %d: %v", partitionID, e.Err())
+			return e.Err()
+		}
+	}
+	// Reset the ResumeAll flag on the stream.
+	stream.SetResumeAll(false)
+	return nil
+}
+
+func (a *apiServer) unpausePartition(ctx context.Context, partition *proto.Partition) *status.Status {
+	// Unpause a partition by re-creating it.
+	return a.metadata.CreatePartition(ctx, &proto.CreatePartitionOp{Partition: partition})
+}
+
 func (a *apiServer) getPublishSubject(req *client.PublishRequest) (string, error) {
 	if req.Subject != "" {
 		return req.Subject, nil
@@ -219,7 +290,7 @@ func (a *apiServer) getPublishSubject(req *client.PublishRequest) (string, error
 	if stream == nil {
 		return "", status.Error(codes.NotFound, fmt.Sprintf("No such stream: %s", req.Stream))
 	}
-	subject := stream.subject
+	subject := stream.GetSubject()
 	if req.Partition > 0 {
 		subject = fmt.Sprintf("%s.%d", subject, req.Partition)
 	}
