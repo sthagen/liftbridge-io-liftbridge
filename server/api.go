@@ -3,7 +3,6 @@ package server
 import (
 	"context"
 	"fmt"
-	"time"
 
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nuid"
@@ -14,8 +13,6 @@ import (
 	"github.com/liftbridge-io/liftbridge/server/commitlog"
 	proto "github.com/liftbridge-io/liftbridge/server/protocol"
 )
-
-const raftApplyTimeout = 30 * time.Second
 
 // apiServer implements the gRPC server interface clients interact with.
 type apiServer struct {
@@ -35,8 +32,8 @@ func (a *apiServer) CreateStream(ctx context.Context, req *client.CreateStreamRe
 	if req.Partitions == 0 {
 		req.Partitions = 1
 	}
-	a.logger.Debugf("api: CreateStream [subject=%s, name=%s, partitions=%d, replicationFactor=%d]",
-		req.Subject, req.Name, req.Partitions, req.ReplicationFactor)
+	a.logger.Debugf("api: CreateStream [name=%s, subject=%s, partitions=%d, replicationFactor=%d]",
+		req.Name, req.Subject, req.Partitions, req.ReplicationFactor)
 
 	if req.Name == "" {
 		a.logger.Errorf("api: Failed to create stream: name cannot be empty")
@@ -48,28 +45,31 @@ func (a *apiServer) CreateStream(ctx context.Context, req *client.CreateStreamRe
 		return nil, status.Error(codes.InvalidArgument, "Subject cannot be empty")
 	}
 
-	var err error
+	partitions := make([]*proto.Partition, req.Partitions)
 	for i := int32(0); i < req.Partitions; i++ {
-		if e := a.metadata.CreatePartition(ctx, &proto.CreatePartitionOp{
-			Partition: &proto.Partition{
-				Subject:           req.Subject,
-				Stream:            req.Name,
-				Group:             req.Group,
-				ReplicationFactor: req.ReplicationFactor,
-				Id:                i,
-			},
-		}); e != nil {
-			// In the case of partial failure, let the caller retry.
-			if e.Code() == codes.AlreadyExists {
-				err = e.Err()
-			} else {
-				a.logger.Errorf("api: Failed to create stream partition %d: %v", i, e.Err())
-				return nil, e.Err()
-			}
+		partitions[i] = &proto.Partition{
+			Subject:           req.Subject,
+			Stream:            req.Name,
+			Group:             req.Group,
+			ReplicationFactor: req.ReplicationFactor,
+			Id:                i,
 		}
 	}
 
-	return resp, err
+	stream := &proto.Stream{
+		Name:       req.Name,
+		Subject:    req.Subject,
+		Partitions: partitions,
+	}
+
+	if e := a.metadata.CreateStream(ctx, &proto.CreateStreamOp{Stream: stream}); e != nil {
+		if e.Code() != codes.AlreadyExists {
+			a.logger.Errorf("api: Failed to create stream %s: %v", req.Name, e.Err())
+		}
+		return nil, e.Err()
+	}
+
+	return resp, nil
 }
 
 // DeleteStream deletes a stream attached to a NATS subject.
@@ -99,6 +99,16 @@ func (a *apiServer) PauseStream(ctx context.Context, req *client.PauseStreamRequ
 	resp := &client.PauseStreamResponse{}
 	a.logger.Debugf("api: PauseStream [name=%s, partitions=%v, resumeAll=%v]",
 		req.Name, req.Partitions, req.ResumeAll)
+
+	if len(req.Partitions) == 0 {
+		stream := a.metadata.GetStream(req.Name)
+		if stream == nil {
+			return nil, status.Error(codes.NotFound, "stream not found")
+		}
+		for _, partition := range stream.GetPartitions() {
+			req.Partitions = append(req.Partitions, partition.Id)
+		}
+	}
 
 	if e := a.metadata.PauseStream(ctx, &proto.PauseStreamOp{
 		Stream:     req.Name,
@@ -130,8 +140,12 @@ func (a *apiServer) Subscribe(req *client.SubscribeRequest, out client.API_Subsc
 
 	leader, _ := partition.GetLeader()
 	if leader != a.config.Clustering.ServerID {
-		a.logger.Errorf("api: Failed to subscribe to partition %s: server not stream leader", partition)
-		return status.Error(codes.FailedPrecondition, "Server not partition leader")
+		if req.ReadISRReplica {
+			a.logger.Info("api: Accepting subscription to partition %s: server not stream leader", partition)
+		} else {
+			a.logger.Errorf("api: Failed to subscribe to partition %s: server not stream leader", partition)
+			return status.Error(codes.FailedPrecondition, "Server not partition leader")
+		}
 	}
 
 	cancel := make(chan struct{})
@@ -177,17 +191,18 @@ func (a *apiServer) FetchMetadata(ctx context.Context, req *client.FetchMetadata
 	return resp, nil
 }
 
-// Publish a new message to a subject. If the AckPolicy is not NONE and a
+// Publish a new message to a stream. If the AckPolicy is not NONE and a
 // deadline is provided, this will synchronously block until the ack is
 // received. If the ack is not received in time, a DeadlineExceeded status code
 // is returned.
 func (a *apiServer) Publish(ctx context.Context, req *client.PublishRequest) (
 	*client.PublishResponse, error) {
+	a.logger.Debugf("api: Publish [stream=%s, partition=%d]", req.Stream, req.Partition)
+
 	subject, err := a.getPublishSubject(req)
 	if err != nil {
 		return nil, err
 	}
-	a.logger.Debugf("api: Publish [subject=%s]", subject)
 
 	err = a.resumeStream(ctx, req.Stream, req.Partition)
 	if err != nil {
@@ -198,93 +213,107 @@ func (a *apiServer) Publish(ctx context.Context, req *client.PublishRequest) (
 		req.AckInbox = nuid.Next()
 	}
 
-	msg := &client.Message{
-		Key:           req.Key,
-		Value:         req.Value,
-		Stream:        req.Stream,
-		Subject:       subject,
-		ReplySubject:  req.ReplySubject,
-		Headers:       req.Headers,
-		AckInbox:      req.AckInbox,
-		CorrelationId: req.CorrelationId,
-		AckPolicy:     req.AckPolicy,
-	}
-
-	buf, err := proto.MarshalPublish(msg)
-	if err != nil {
-		a.logger.Errorf("api: Failed to marshal message: %v", err.Error())
-		return nil, err
-	}
-
-	// If AckPolicy is NONE or a timeout isn't specified, then we will fire and
-	// forget.
 	var (
-		resp           = new(client.PublishResponse)
-		_, hasDeadline = ctx.Deadline()
-	)
-	if req.AckPolicy == client.AckPolicy_NONE || !hasDeadline {
-		if err := a.ncPublishes.Publish(subject, buf); err != nil {
-			a.logger.Errorf("api: Failed to publish message: %v", err)
-			return nil, err
+		msg = &client.Message{
+			Key:           req.Key,
+			Value:         req.Value,
+			Stream:        req.Stream,
+			Subject:       subject,
+			Headers:       req.Headers,
+			AckInbox:      req.AckInbox,
+			CorrelationId: req.CorrelationId,
+			AckPolicy:     req.AckPolicy,
 		}
-		return resp, nil
+		resp = new(client.PublishResponse)
+	)
+
+	ack, err := a.publish(ctx, subject, req.AckInbox, req.AckPolicy, msg)
+	resp.Ack = ack
+
+	return resp, err
+
+}
+
+// Publish a Liftbridge message to a NATS subject. If the AckPolicy is not NONE
+// and a deadline is provided, this will synchronously block until the first
+// ack is received. If an ack is not received in time, a DeadlineExceeded
+// status code is returned.
+func (a *apiServer) PublishToSubject(ctx context.Context, req *client.PublishToSubjectRequest) (
+	*client.PublishToSubjectResponse, error) {
+	a.logger.Debugf("api: PublishToSubject [subject=%s]", req.Subject)
+
+	if req.AckInbox == "" {
+		req.AckInbox = nuid.Next()
 	}
 
-	// Otherwise we need to publish and wait for the ack.
-	resp.Ack, err = a.publishSync(ctx, subject, req.AckInbox, buf)
+	var (
+		msg = &client.Message{
+			Key:           req.Key,
+			Value:         req.Value,
+			Subject:       req.Subject,
+			Headers:       req.Headers,
+			AckInbox:      req.AckInbox,
+			CorrelationId: req.CorrelationId,
+			AckPolicy:     req.AckPolicy,
+		}
+		resp = new(client.PublishToSubjectResponse)
+	)
+
+	ack, err := a.publish(ctx, req.Subject, req.AckInbox, req.AckPolicy, msg)
+	resp.Ack = ack
+
 	return resp, err
 }
 
 func (a *apiServer) resumeStream(ctx context.Context, streamName string, partitionID int32) error {
-	if streamName == "" {
-		return nil
-	}
 	stream := a.metadata.GetStream(streamName)
 	if stream == nil {
 		return status.Error(codes.NotFound, fmt.Sprintf("No such stream: %s", streamName))
 	}
-	if !stream.GetResumeAll() {
-		// Just resume the partition being published to if it's paused.
+	var toResume []int32
+	if stream.GetResumeAll() {
+		// If ResumeAll is enabled, resume any paused partitions in the stream.
+		partitions := stream.GetPartitions()
+		toResume = make([]int32, 0, len(partitions))
+		for _, partition := range partitions {
+			if !partition.IsPaused() {
+				continue
+			}
+			toResume = append(toResume, partition.Id)
+		}
+	} else {
+		// Otherwise just resume the partition being published to if it's
+		// paused.
 		partition := stream.GetPartition(partitionID)
 		if partition == nil {
 			return status.Error(codes.NotFound, fmt.Sprintf("No such partition: %d", partitionID))
 		}
 		if partition.IsPaused() {
-			if e := a.unpausePartition(ctx, partition.Partition); e != nil {
-				a.logger.Errorf("api: Failed to resume stream partition %d: %v", partitionID, e.Err())
-				return e.Err()
-			}
+			toResume = []int32{partition.Id}
 		}
+	}
+
+	if len(toResume) == 0 {
 		return nil
 	}
 
-	// If ResumeAll is enabled, resume any paused partitions in the stream.
-	for partitionID, partition := range stream.GetPartitions() {
-		// Do not try to resume an unpaused partition.
-		if !partition.IsPaused() {
-			continue
-		}
-		if e := a.unpausePartition(ctx, partition.Partition); e != nil {
-			a.logger.Errorf("api: Failed to resume stream partition %d: %v", partitionID, e.Err())
-			return e.Err()
-		}
+	req := &proto.ResumeStreamOp{
+		Stream:     stream.GetName(),
+		Partitions: toResume,
 	}
+	if e := a.metadata.ResumeStream(ctx, req); e != nil {
+		a.logger.Errorf("api: Failed to resume stream: %v", e.Err())
+		return e.Err()
+	}
+
 	// Reset the ResumeAll flag on the stream.
 	stream.SetResumeAll(false)
 	return nil
 }
 
-func (a *apiServer) unpausePartition(ctx context.Context, partition *proto.Partition) *status.Status {
-	// Unpause a partition by re-creating it.
-	return a.metadata.CreatePartition(ctx, &proto.CreatePartitionOp{Partition: partition})
-}
-
 func (a *apiServer) getPublishSubject(req *client.PublishRequest) (string, error) {
-	if req.Subject != "" {
-		return req.Subject, nil
-	}
 	if req.Stream == "" {
-		return "", status.Error(codes.InvalidArgument, "No stream or subject provided")
+		return "", status.Error(codes.InvalidArgument, "No stream provided")
 	}
 	stream := a.metadata.GetStream(req.Stream)
 	if stream == nil {
@@ -295,6 +324,30 @@ func (a *apiServer) getPublishSubject(req *client.PublishRequest) (string, error
 		subject = fmt.Sprintf("%s.%d", subject, req.Partition)
 	}
 	return subject, nil
+}
+
+func (a *apiServer) publish(ctx context.Context, subject, ackInbox string,
+	ackPolicy client.AckPolicy, msg *client.Message) (*client.Ack, error) {
+
+	buf, err := proto.MarshalPublish(msg)
+	if err != nil {
+		a.logger.Errorf("api: Failed to marshal message: %v", err.Error())
+		return nil, err
+	}
+
+	// If AckPolicy is NONE or a timeout isn't specified, then we will fire and
+	// forget.
+	_, hasDeadline := ctx.Deadline()
+	if ackPolicy == client.AckPolicy_NONE || !hasDeadline {
+		if err := a.ncPublishes.Publish(subject, buf); err != nil {
+			a.logger.Errorf("api: Failed to publish message: %v", err)
+			return nil, err
+		}
+		return nil, nil
+	}
+
+	// Otherwise we need to publish and wait for the ack.
+	return a.publishSync(ctx, subject, ackInbox, buf)
 }
 
 func (a *apiServer) publishSync(ctx context.Context, subject,
@@ -365,7 +418,15 @@ func (a *apiServer) subscribe(ctx context.Context, partition *partition,
 			if err != nil {
 				var s *status.Status
 				if err == commitlog.ErrCommitLogDeleted {
+					// Partition was deleted while subscribed.
 					s = status.New(codes.NotFound, err.Error())
+				} else if err == commitlog.ErrCommitLogClosed {
+					// Partition was closed while subscribed (likely paused).
+					code := codes.Internal
+					if partition.IsPaused() {
+						code = codes.FailedPrecondition
+					}
+					s = status.New(code, err.Error())
 				} else {
 					s = status.Convert(err)
 				}

@@ -5,6 +5,9 @@
     "previous": "Previous",
     "tagline": "Lightweight, fault-tolerant message streams",
     "docs": {
+      "activity": {
+        "title": "Activity Stream"
+      },
       "client-implementation": {
         "title": "Client Implementation Guidance"
       },
@@ -26,11 +29,17 @@
       "faq": {
         "title": "Frequently Asked Questions"
       },
+      "feature-comparison": {
+        "title": "Feature Comparison"
+      },
       "ha-and-consistency-configuration": {
         "title": "Configuring for High Availability and Consistency"
       },
       "overview": {
         "title": "Liftbridge Overview"
+      },
+      "pausing-streams": {
+        "title": "Pausing Streams"
       },
       "quick-start": {
         "title": "Quick Start"
@@ -133,17 +142,56 @@
       },
       "version-v1.0.0-beta/version-v1.0.0-beta-replication-protocol": {
         "title": "Replication Protocol"
+      },
+      "version-v1.0.0/version-v1.0.0-activity": {
+        "title": "Activity Stream"
+      },
+      "version-v1.0.0/version-v1.0.0-client-implementation": {
+        "title": "Client Implementation Guidance"
+      },
+      "version-v1.0.0/version-v1.0.0-clients": {
+        "title": "Clients"
+      },
+      "version-v1.0.0/version-v1.0.0-concepts": {
+        "title": "Concepts"
+      },
+      "version-v1.0.0/version-v1.0.0-configuration": {
+        "title": "Configuration"
+      },
+      "version-v1.0.0/version-v1.0.0-deployment": {
+        "title": "Deployment"
+      },
+      "version-v1.0.0/version-v1.0.0-faq": {
+        "title": "Frequently Asked Questions"
+      },
+      "version-v1.0.0/version-v1.0.0-feature-comparison": {
+        "title": "Feature Comparison"
+      },
+      "version-v1.0.0/version-v1.0.0-ha-and-consistency-configuration": {
+        "title": "Configuring for High Availability and Consistency"
+      },
+      "version-v1.0.0/version-v1.0.0-overview": {
+        "title": "Liftbridge Overview"
+      },
+      "version-v1.0.0/version-v1.0.0-pausing-streams": {
+        "title": "Pausing Streams"
+      },
+      "version-v1.0.0/version-v1.0.0-quick-start": {
+        "title": "Quick Start"
       }
     },
     "links": {
       "GitHub": "GitHub",
       "Docs": "Docs",
+      "Download": "Download",
+      "Blog": "Blog",
       "Help": "Help"
     },
     "categories": {
       "Overview": "Overview",
       "Configuration": "Configuration",
       "Deployment": "Deployment",
+      "Developing With Liftbridge": "Developing With Liftbridge",
       "Technical Deep Dive": "Technical Deep Dive",
       "Client Libraries": "Client Libraries"
     }

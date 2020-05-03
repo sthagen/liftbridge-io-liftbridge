@@ -1,6 +1,7 @@
 ---
-id: overview
+id: version-v1.0.0-overview
 title: Liftbridge Overview
+original_id: overview
 ---
 
 Liftbridge is a server that implements a durable, replicated message log for

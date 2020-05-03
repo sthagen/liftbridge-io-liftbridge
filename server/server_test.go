@@ -12,7 +12,6 @@ import (
 	"time"
 
 	lift "github.com/liftbridge-io/go-liftbridge"
-	liftApi "github.com/liftbridge-io/liftbridge-api/go"
 	natsdTest "github.com/nats-io/nats-server/v2/test"
 	log "github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
@@ -85,6 +84,17 @@ func getMetadataLeader(t *testing.T, timeout time.Duration, servers ...*Server) 
 	if leader == nil {
 		stackFatalf(t, "No metadata leader found")
 	}
+
+	// Wait for cluster to agree on leader.
+LOOP:
+	for time.Now().Before(deadline) {
+		for _, s := range servers {
+			if string(s.getRaft().Leader()) != leader.config.Clustering.ServerID {
+				continue LOOP
+			}
+		}
+		break
+	}
 	return leader
 }
 
@@ -106,14 +116,24 @@ func waitForNoMetadataLeader(t *testing.T, timeout time.Duration, servers ...*Se
 	stackFatalf(t, "Metadata leader found")
 }
 
-func checkPartitionPaused(t *testing.T, stream string, partitionID int32, paused bool, server *Server) {
+func checkPartitionPaused(t *testing.T, timeout time.Duration, stream string,
+	partitionID int32, paused bool, server *Server) {
+
 	partition := server.metadata.GetPartition(stream, partitionID)
 	if partition == nil {
 		stackFatalf(t, "Partition not found")
 	}
-	if isPaused := partition.IsPaused(); isPaused != paused {
-		stackFatalf(t, "Expected partition paused %v, got %v", paused, isPaused)
+	var (
+		deadline = time.Now().Add(timeout)
+		isPaused bool
+	)
+	for time.Now().Before(deadline) {
+		isPaused = partition.IsPaused()
+		if isPaused == paused {
+			return
+		}
 	}
+	stackFatalf(t, "Expected partition paused %v, got %v", paused, isPaused)
 }
 
 func getPartitionLeader(t *testing.T, timeout time.Duration, name string, partitionID int32, servers ...*Server) *Server {
@@ -532,7 +552,7 @@ func TestSubscribeOffsetOverflow(t *testing.T) {
 	// starting at offset 5.
 	gotMsg := make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
-	err = client.Subscribe(ctx, name, func(msg lift.Message, err error) {
+	err = client.Subscribe(ctx, name, func(msg *lift.Message, err error) {
 		require.NoError(t, err)
 		require.Equal(t, int64(5), msg.Offset())
 		close(gotMsg)
@@ -583,7 +603,7 @@ func TestSubscribeOffsetOverflowEmptyStream(t *testing.T) {
 	// starting at offset 0.
 	gotMsg := make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
-	err = client.Subscribe(ctx, name, func(msg lift.Message, err error) {
+	err = client.Subscribe(ctx, name, func(msg *lift.Message, err error) {
 		require.NoError(t, err)
 		require.Equal(t, int64(0), msg.Offset())
 		close(gotMsg)
@@ -649,7 +669,7 @@ func TestSubscribeOffsetUnderflow(t *testing.T) {
 	// Subscribe with underflowed offset. This should set the offset to 1.
 	gotMsg := make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
-	err = client.Subscribe(ctx, name, func(msg lift.Message, err error) {
+	err = client.Subscribe(ctx, name, func(msg *lift.Message, err error) {
 		require.NoError(t, err)
 		require.Equal(t, int64(1), msg.Offset())
 		close(gotMsg)
@@ -708,9 +728,9 @@ func TestStreamRetentionBytes(t *testing.T) {
 	forceLogClean(t, subject, name, s1)
 
 	// The first message read back should have offset 87.
-	msgs := make(chan lift.Message, 1)
+	msgs := make(chan *lift.Message, 1)
 	ctx, cancel := context.WithCancel(context.Background())
-	err = client.Subscribe(ctx, name, func(msg lift.Message, err error) {
+	err = client.Subscribe(ctx, name, func(msg *lift.Message, err error) {
 		require.NoError(t, err)
 		msgs <- msg
 		cancel()
@@ -769,9 +789,9 @@ func TestStreamRetentionMessages(t *testing.T) {
 	forceLogClean(t, subject, name, s1)
 
 	// The first message read back should have offset 5.
-	msgs := make(chan lift.Message, 1)
+	msgs := make(chan *lift.Message, 1)
 	ctx, cancel := context.WithCancel(context.Background())
-	err = client.Subscribe(ctx, name, func(msg lift.Message, err error) {
+	err = client.Subscribe(ctx, name, func(msg *lift.Message, err error) {
 		require.NoError(t, err)
 		msgs <- msg
 		cancel()
@@ -831,9 +851,9 @@ func TestStreamRetentionAge(t *testing.T) {
 
 	// We expect all segments but the last to be truncated due to age, so the
 	// first message read back should have offset 99.
-	msgs := make(chan lift.Message, 1)
+	msgs := make(chan *lift.Message, 1)
 	ctx, cancel := context.WithCancel(context.Background())
-	err = client.Subscribe(ctx, name, func(msg lift.Message, err error) {
+	err = client.Subscribe(ctx, name, func(msg *lift.Message, err error) {
 		require.NoError(t, err)
 		msgs <- msg
 		cancel()
@@ -895,7 +915,7 @@ func TestSubscribeEarliest(t *testing.T) {
 	// Subscribe with EARLIEST. This should start reading from offset 1.
 	gotMsg := make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
-	client.Subscribe(ctx, name, func(msg lift.Message, err error) {
+	client.Subscribe(ctx, name, func(msg *lift.Message, err error) {
 		require.NoError(t, err)
 		require.Equal(t, int64(1), msg.Offset())
 		close(gotMsg)
@@ -949,7 +969,7 @@ func TestSubscribeLatest(t *testing.T) {
 	// Subscribe with LATEST. This should start reading from offset 2.
 	gotMsg := make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
-	client.Subscribe(ctx, name, func(msg lift.Message, err error) {
+	client.Subscribe(ctx, name, func(msg *lift.Message, err error) {
 		require.NoError(t, err)
 		require.Equal(t, int64(2), msg.Offset())
 		close(gotMsg)
@@ -1004,7 +1024,7 @@ func TestSubscribeNewOnly(t *testing.T) {
 	// offset 5.
 	gotMsg := make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
-	err = client.Subscribe(ctx, name, func(msg lift.Message, err error) {
+	err = client.Subscribe(ctx, name, func(msg *lift.Message, err error) {
 		require.NoError(t, err)
 		require.Equal(t, int64(5), msg.Offset())
 		close(gotMsg)
@@ -1073,7 +1093,7 @@ func TestSubscribeStartTime(t *testing.T) {
 	// Subscribe with TIMESTAMP 25. This should start reading from offset 3.
 	gotMsg := make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
-	client.Subscribe(ctx, name, func(msg lift.Message, err error) {
+	client.Subscribe(ctx, name, func(msg *lift.Message, err error) {
 		select {
 		case <-gotMsg:
 			return
@@ -1332,54 +1352,6 @@ func TestPropagatedShrinkExpandISR(t *testing.T) {
 	waitForISR(t, 10*time.Second, name, 0, 2, s1, s2)
 }
 
-// Ensure activity stream partition creation event occurs
-func TestActivityStreamCreatePartition(t *testing.T) {
-	defer cleanupStorage(t)
-
-	// Use a central NATS server.
-	ns := natsdTest.RunDefaultServer()
-	defer ns.Shutdown()
-
-	// Configure server.
-	s1Config := getTestConfig("a", true, 5050)
-	s1Config.ActivityStream.Enabled = true
-	s1Config.ActivityStream.PublishTimeout = time.Second
-	s1Config.ActivityStream.PublishAckPolicy = liftApi.AckPolicy_LEADER
-	s1 := runServerWithConfig(t, s1Config)
-	defer s1.Stop()
-
-	// Wait for server to elect itself leader.
-	getMetadataLeader(t, 10*time.Second, s1)
-
-	client, err := lift.Connect([]string{"localhost:5050"})
-	require.NoError(t, err)
-	defer client.Close()
-
-	// The first message read back should be the creation of the activity stream
-	// partition.
-	msgs := make(chan lift.Message, 1)
-	ctx, cancel := context.WithCancel(context.Background())
-	err = client.Subscribe(ctx, activityStream, func(msg lift.Message, err error) {
-		require.NoError(t, err)
-		msgs <- msg
-		cancel()
-	}, lift.StartAtEarliestReceived())
-	require.NoError(t, err)
-
-	// Wait to get the new message.
-	select {
-	case msg := <-msgs:
-		var se liftApi.ActivityStreamEvent
-		err = se.Unmarshal(msg.Value())
-		require.NoError(t, err)
-		require.Equal(t, liftApi.ActivityStreamOp_CREATE_PARTITION, se.GetOp())
-		require.Equal(t, activityStream, se.CreatePartitionOp.GetStream())
-		require.Equal(t, int32(0), se.CreatePartitionOp.GetPartition())
-	case <-time.After(5 * time.Second):
-		t.Fatal("Did not receive expected message")
-	}
-}
-
 // Test stream pausing and resuming. A paused stream should re-activate itself
 // when a message is published using the Liftbridge API. This test pauses all
 // partitions and checks that only the partition that is published to gets
@@ -1422,8 +1394,8 @@ func TestPauseStreamAllPartitions(t *testing.T) {
 	require.NoError(t, err)
 
 	// Check that both partitions are paused.
-	checkPartitionPaused(t, name, 0, true, s1)
-	checkPartitionPaused(t, name, 1, true, s1)
+	checkPartitionPaused(t, 5*time.Second, name, 0, true, s1)
+	checkPartitionPaused(t, 5*time.Second, name, 1, true, s1)
 
 	// Publish a message to partition 0.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -1431,9 +1403,9 @@ func TestPauseStreamAllPartitions(t *testing.T) {
 	_, err = client.Publish(ctx, name, []byte("hello"))
 	require.NoError(t, err)
 
-	msgs := make(chan lift.Message, 1)
+	msgs := make(chan *lift.Message, 1)
 	ctx, cancel = context.WithCancel(context.Background())
-	err = client.Subscribe(ctx, name, func(msg lift.Message, err error) {
+	err = client.Subscribe(ctx, name, func(msg *lift.Message, err error) {
 		require.NoError(t, err)
 		msgs <- msg
 		cancel()
@@ -1449,8 +1421,8 @@ func TestPauseStreamAllPartitions(t *testing.T) {
 	}
 
 	// Check that partition 0 was resumed but partition 1 is still paused.
-	checkPartitionPaused(t, name, 0, false, s1)
-	checkPartitionPaused(t, name, 1, true, s1)
+	checkPartitionPaused(t, 5*time.Second, name, 0, false, s1)
+	checkPartitionPaused(t, 5*time.Second, name, 1, true, s1)
 }
 
 // Test stream pausing and resuming. A paused stream should re-activate itself
@@ -1490,8 +1462,8 @@ func TestPauseStreamSomePartitions(t *testing.T) {
 	require.NoError(t, err)
 
 	// Check that only partition 0 is paused.
-	checkPartitionPaused(t, name, 0, true, s1)
-	checkPartitionPaused(t, name, 1, false, s1)
+	checkPartitionPaused(t, 5*time.Second, name, 0, true, s1)
+	checkPartitionPaused(t, 5*time.Second, name, 1, false, s1)
 
 	// Publish a message to the non-paused partition, which should resume the
 	// paused partition since ResumeAll was enabled.
@@ -1500,9 +1472,9 @@ func TestPauseStreamSomePartitions(t *testing.T) {
 	_, err = client.Publish(ctx, name, []byte("hello"), lift.ToPartition(1))
 	require.NoError(t, err)
 
-	msgs := make(chan lift.Message, 1)
+	msgs := make(chan *lift.Message, 1)
 	ctx, cancel = context.WithCancel(context.Background())
-	err = client.Subscribe(ctx, name, func(msg lift.Message, err error) {
+	err = client.Subscribe(ctx, name, func(msg *lift.Message, err error) {
 		require.NoError(t, err)
 		msgs <- msg
 		cancel()
@@ -1518,12 +1490,13 @@ func TestPauseStreamSomePartitions(t *testing.T) {
 	}
 
 	// Check that both partitions are resumed.
-	checkPartitionPaused(t, name, 0, false, s1)
-	checkPartitionPaused(t, name, 1, false, s1)
+	checkPartitionPaused(t, 5*time.Second, name, 0, false, s1)
+	checkPartitionPaused(t, 5*time.Second, name, 1, false, s1)
 }
 
 // Ensure pausing a stream works when we send the request to the metadata
-// follower.
+// follower and resuming the stream works when the resuming publish is sent to
+// the follower.
 func TestPauseStreamPropagate(t *testing.T) {
 	defer cleanupStorage(t)
 
@@ -1548,11 +1521,25 @@ func TestPauseStreamPropagate(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	err = client.CreateStream(ctx, "foo", "foo")
+	name := "foo"
+	err = client.CreateStream(ctx, "foo", name)
 	require.NoError(t, err)
 
-	err = client.PauseStream(context.Background(), "foo")
+	// Pause stream on follower.
+	err = client.PauseStream(context.Background(), name)
 	require.NoError(t, err)
+
+	checkPartitionPaused(t, 5*time.Second, name, 0, true, s1)
+	checkPartitionPaused(t, 5*time.Second, name, 0, true, s2)
+
+	// Resume stream by publishing to follower.
+	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err = client.Publish(ctx, name, []byte("hello"))
+	require.NoError(t, err)
+
+	checkPartitionPaused(t, 5*time.Second, name, 0, false, s1)
+	checkPartitionPaused(t, 5*time.Second, name, 0, false, s2)
 }
 
 // Ensure publishing to a non-existent stream returns an error.

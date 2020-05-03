@@ -1,6 +1,7 @@
 ---
-id: deployment
+id: version-v1.0.0-deployment
 title: Deployment
+original_id: deployment
 ---
 
 ## Development / Testing
