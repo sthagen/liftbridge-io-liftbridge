@@ -7,27 +7,29 @@ message ServerState {
 }
 
 enum Op {
-    CREATE_STREAM    = 0;
-    SHRINK_ISR       = 1;
-    REPORT_LEADER    = 2;
-    CHANGE_LEADER    = 3;
-    EXPAND_ISR       = 4;
-    DELETE_STREAM    = 5;
-    PAUSE_STREAM     = 6;
-    RESUME_STREAM    = 7;
-    PUBLISH_ACTIVITY = 8;
+    CREATE_STREAM       = 0;
+    SHRINK_ISR          = 1;
+    REPORT_LEADER       = 2;
+    CHANGE_LEADER       = 3;
+    EXPAND_ISR          = 4;
+    DELETE_STREAM       = 5;
+    PAUSE_STREAM        = 6;
+    RESUME_STREAM       = 7;
+    PUBLISH_ACTIVITY    = 8;
+    SET_STREAM_READONLY = 9;
 }
 
 message RaftLog {
-    Op                op                = 1;
-    CreateStreamOp    createStreamOp    = 2;
-    ShrinkISROp       shrinkISROp       = 3;
-    ChangeLeaderOp    changeLeaderOp    = 4;
-    ExpandISROp       expandISROp       = 5;
-    DeleteStreamOp    deleteStreamOp    = 6;
-    PauseStreamOp     pauseStreamOp     = 7;
-    ResumeStreamOp    resumeStreamOp    = 8;
-    PublishActivityOp publishActivityOp = 9;
+    Op                  op                  = 1;
+    CreateStreamOp      createStreamOp      = 2;
+    ShrinkISROp         shrinkISROp         = 3;
+    ChangeLeaderOp      changeLeaderOp      = 4;
+    ExpandISROp         expandISROp         = 5;
+    DeleteStreamOp      deleteStreamOp      = 6;
+    PauseStreamOp       pauseStreamOp       = 7;
+    ResumeStreamOp      resumeStreamOp      = 8;
+    PublishActivityOp   publishActivityOp   = 9;
+    SetStreamReadonlyOp setStreamReadonlyOp = 10;
 }
 
 message CreateStreamOp {
@@ -83,10 +85,44 @@ message PublishActivityOp {
     uint64 raftIndex = 1;
 }
 
+message SetStreamReadonlyOp {
+    string         stream     = 1;
+    repeated int32 partitions = 2;
+    bool           readonly   = 3;
+}
+
+message NullableInt64 {
+    int64 value = 1; 
+}
+
+message NullableInt32 {
+    int32 value = 1; 
+}
+
+message NullableBool {
+    bool value = 1; 
+}
+
+message StreamConfig  {
+    NullableInt64 retentionMaxBytes             = 1;
+    NullableInt64 retentionMaxMessages          = 2;
+    NullableInt64 retentionMaxAge               = 3;  
+    NullableInt64 cleanerInterval               = 4;
+    NullableInt64 segmentMaxBytes               = 5;
+    NullableInt64 segmentMaxAge                 = 6;
+    NullableInt32 compactMaxGoroutines          = 7;
+    NullableBool  compactEnabled                = 8;
+    NullableInt64 autoPauseTime                 = 9;
+    NullableBool  autoPauseDisableIfSubscribers = 10;
+    NullableInt32 minIsr                        = 11;
+}
+
 message Stream {
-    string             name       = 1;
-    string             subject    = 2;
-    repeated Partition partitions = 3;
+    string             name              = 1;
+    string             subject           = 2;
+    repeated Partition partitions        = 3;
+    StreamConfig       config            = 4;
+    int64              creationTimestamp = 5;
 }
 
 message Partition {
@@ -101,6 +137,7 @@ message Partition {
     uint64          leaderEpoch       = 9;
     uint64          epoch             = 10;
     bool            paused            = 11; // Only used for snapshotting.
+    bool            readonly          = 12; // Only used for snapshotting.
 }
 
 // RaftJoinRequest is a request to join a Raft group.
@@ -133,14 +170,15 @@ message LeaderEpochOffsetResponse {
 }
 
 message PropagatedRequest {
-    Op             op             = 1;
-    CreateStreamOp createStreamOp = 2;
-    ShrinkISROp    shrinkISROp    = 3;
-    ReportLeaderOp reportLeaderOp = 4;
-    ExpandISROp    expandISROp    = 5;
-    DeleteStreamOp deleteStreamOp = 6;
-    PauseStreamOp  pauseStreamOp  = 7;
-    ResumeStreamOp resumeStreamOp = 8;
+    Op                  op                  = 1;
+    CreateStreamOp      createStreamOp      = 2;
+    ShrinkISROp         shrinkISROp         = 3;
+    ReportLeaderOp      reportLeaderOp      = 4;
+    ExpandISROp         expandISROp         = 5;
+    DeleteStreamOp      deleteStreamOp      = 6;
+    PauseStreamOp       pauseStreamOp       = 7;
+    ResumeStreamOp      resumeStreamOp      = 8;
+    SetStreamReadonlyOp setStreamReadonlyOp = 9;
 }
 
 message Error {
@@ -157,7 +195,8 @@ message PropagatedResponse {
     // Reserving = 6 for expandISRResp if needed.
     // Reserving = 7 for deleteStreamResp if needed.
     // Reserving = 8 for pauseStreamResp if needed.
-    // Reserving = 9 for resumePartitionResp if needed.
+    // Reserving = 9 for resumeStreamResp if needed.
+    // Reserving = 10 for setStreamReadonlyResp if needed.
 }
 
 message ServerInfoRequest {
@@ -183,4 +222,11 @@ message PartitionStatusResponse {
 message PartitionNotification {
     string stream    = 1;
     int32  partition = 2;
+}
+
+message Cursor {
+    string stream    = 1;
+    int32  partition = 2;
+    string cursorId  = 3;
+    int64  offset    = 4;
 }

@@ -20,6 +20,9 @@
       "configuration": {
         "title": "Configuration"
       },
+      "cursors": {
+        "title": "Cursors"
+      },
       "deployment": {
         "title": "Deployment"
       },
@@ -46,6 +49,9 @@
       },
       "replication-protocol": {
         "title": "Replication Protocol"
+      },
+      "roadmap": {
+        "title": "Product Roadmap"
       },
       "version-v0.0.1-alpha/version-v0.0.1-alpha-client-implementation": {
         "title": "Client Implementation Guidance"
@@ -178,6 +184,24 @@
       },
       "version-v1.0.0/version-v1.0.0-quick-start": {
         "title": "Quick Start"
+      },
+      "version-v1.1.0/version-v1.1.0-configuration": {
+        "title": "Configuration"
+      },
+      "version-v1.1.0/version-v1.1.0-quick-start": {
+        "title": "Quick Start"
+      },
+      "version-v1.2.0/version-v1.2.0-client-implementation": {
+        "title": "Client Implementation Guidance"
+      },
+      "version-v1.2.0/version-v1.2.0-configuration": {
+        "title": "Configuration"
+      },
+      "version-v1.2.0/version-v1.2.0-quick-start": {
+        "title": "Quick Start"
+      },
+      "version-v1.2.0/version-v1.2.0-roadmap": {
+        "title": "Product Roadmap"
       }
     },
     "links": {

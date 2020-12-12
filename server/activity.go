@@ -2,14 +2,14 @@ package server
 
 import (
 	"context"
-	"fmt"
 	"sync"
 	"time"
 
 	"github.com/hashicorp/raft"
-	lift "github.com/liftbridge-io/go-liftbridge"
 	client "github.com/liftbridge-io/liftbridge-api/go"
 	"github.com/pkg/errors"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	proto "github.com/liftbridge-io/liftbridge/server/protocol"
 )
@@ -22,7 +22,6 @@ const maxActivityPublishBackoff = 10 * time.Second
 type activityManager struct {
 	*Server
 	lastPublishedRaftIndex uint64
-	client                 lift.Client
 	commitCh               chan struct{}
 	leadershipLostCh       chan struct{}
 	mu                     sync.RWMutex
@@ -33,16 +32,6 @@ func newActivityManager(s *Server) *activityManager {
 		Server:   s,
 		commitCh: make(chan struct{}, 1),
 	}
-}
-
-// Close the activity manager and any resources associated with it.
-func (a *activityManager) Close() error {
-	if a.client != nil {
-		if err := a.client.Close(); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 // SetLastPublishedRaftIndex sets the Raft index of the latest event published
@@ -72,10 +61,10 @@ func (a *activityManager) SignalCommit() {
 }
 
 // BecomeLeader should be called when this node has been elected as the
-// metadata leader. This will create a loopback Liftbridge client and set up
-// the activity stream if it's enabled. It will then reconcile the last
-// published event with the Raft log and begin publishing any un-published
-// events. This should be called on the same goroutine as BecomeFollower.
+// metadata leader. This will set up the activity stream if it's enabled. It
+// will then reconcile the last published event with the Raft log and begin
+// publishing any un-published events. This should be called on the same
+// goroutine as BecomeFollower.
 func (a *activityManager) BecomeLeader() error {
 	if !a.config.ActivityStream.Enabled {
 		return nil
@@ -89,17 +78,15 @@ func (a *activityManager) BecomeLeader() error {
 }
 
 // BecomeFollower should be called when this node has lost metadata leadership.
-// This will close the loopback Liftbridge client if it exists. This should be
-// called on the same goroutine as BecomeLeader.
+// This should be called on the same goroutine as BecomeLeader.
 func (a *activityManager) BecomeFollower() error {
 	if !a.config.ActivityStream.Enabled {
 		return nil
 	}
-	if err := a.Close(); err != nil {
-		return err
-	}
 
-	close(a.leadershipLostCh)
+	if a.leadershipLostCh != nil {
+		close(a.leadershipLostCh)
+	}
 	return nil
 }
 
@@ -203,6 +190,15 @@ func (a *activityManager) handleRaftLog(l *raft.Log) error {
 				Partitions: log.ResumeStreamOp.Partitions,
 			},
 		}
+	case proto.Op_SET_STREAM_READONLY:
+		event = &client.ActivityStreamEvent{
+			Op: client.ActivityStreamOp_SET_STREAM_READONLY,
+			SetStreamReadonlyOp: &client.SetStreamReadonlyOp{
+				Stream:     log.SetStreamReadonlyOp.Stream,
+				Partitions: log.SetStreamReadonlyOp.Partitions,
+				Readonly:   log.SetStreamReadonlyOp.Readonly,
+			},
+		}
 	default:
 		return nil
 	}
@@ -213,21 +209,12 @@ func (a *activityManager) handleRaftLog(l *raft.Log) error {
 // createActivityStream creates the activity stream and connects a local client
 // that will be subscribed to it.
 func (a *activityManager) createActivityStream() error {
-	// Connect a local client that will be used to publish on the activity
-	// stream.
-	listenAddr := a.config.GetListenAddress()
-	var err error
-	a.client, err = lift.Connect([]string{fmt.Sprintf("%s:%d", listenAddr.Host, a.port)})
-	if err != nil {
-		return errors.Wrap(err, "failed to connect the activity stream client")
-	}
-
-	err = a.client.CreateStream(context.Background(),
-		a.getActivityStreamSubject(),
-		activityStream,
-		lift.MaxReplication(),
-	)
-	if err != nil && err != lift.ErrStreamExists {
+	_, err := a.api.CreateStream(context.Background(), &client.CreateStreamRequest{
+		Subject:           a.getActivityStreamSubject(),
+		Name:              activityStream,
+		ReplicationFactor: -1,
+	})
+	if err != nil && status.Convert(err).Code() != codes.AlreadyExists {
 		return errors.Wrap(err, "failed to create an activity stream")
 	}
 
@@ -244,25 +231,11 @@ func (a *activityManager) publishActivityEvent(event *client.ActivityStreamEvent
 	ctx, cancel := context.WithTimeout(context.Background(), a.config.ActivityStream.PublishTimeout)
 	defer cancel()
 
-	var messageOption lift.MessageOption
-	ackPolicy := a.config.ActivityStream.PublishAckPolicy
-	switch ackPolicy {
-	case client.AckPolicy_LEADER:
-		messageOption = lift.AckPolicyLeader()
-	case client.AckPolicy_ALL:
-		messageOption = lift.AckPolicyAll()
-	case client.AckPolicy_NONE:
-		messageOption = lift.AckPolicyNone()
-	default:
-		panic(fmt.Sprintf("Unknown ack policy: %v", ackPolicy))
-	}
-
-	_, err = a.client.Publish(
-		ctx,
-		activityStream,
-		data,
-		messageOption,
-	)
+	_, err = a.api.Publish(ctx, &client.PublishRequest{
+		Value:     data,
+		Stream:    activityStream,
+		AckPolicy: a.config.ActivityStream.PublishAckPolicy,
+	})
 	if err != nil {
 		return errors.Wrap(err, "failed to publish event to stream")
 	}

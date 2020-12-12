@@ -28,20 +28,23 @@ to implementing a high-level client.
 
 ## Client Interface
 
-A high-level client has several operations:
+A high-level client has the following operations:
 
-- [`CreateStream`](#createstream): creates a new stream attached to a NATS
-  subject (or group of related NATS subjects if partitioned)
-- [`DeleteStream`](#deletestream): deletes a stream and all of its partitions
-- [`PauseStream`](#pausestream): pauses some or all of a stream's partitions
-  until they are published to
-- [`Subscribe`](#subscribe): creates an ephemeral subscription for a given
-  stream that messages are received on
-- [`Publish`](#publish): publishes a new message to a Liftbridge stream
-- [`PublishToSubject`](#publishtosubject): publishes a new message to a NATS
-  subject
-- [`FetchMetadata`](#fetchmetadata): retrieves metadata from the cluster
-- [`Close`](#close): closes any client connections to Liftbridge
+| Operation | Description |
+|:----|:----|
+| [CreateStream](#createstream) | Creates a new stream attached to a NATS subject (or group of related NATS subjects if partitioned) |
+| [DeleteStream](#deletestream) | Deletes a stream and all of its partitions |
+| [PauseStream](#pausestream) | Pauses some or all of a stream's partitions until they are published to |
+| [SetStreamReadonly](#setstreamreadonly) | Sets some or all of a stream's partitions as readonly or readwrite |
+| [Subscribe](#subscribe) | Creates an ephemeral subscription for a given stream that messages are received on |
+| [Publish](#publish) | Publishes a new message to a Liftbridge stream |
+| [PublishAsync](#publishasync) | Publishes a new message to a Liftbridge stream asynchronously |
+| [PublishToSubject](#publishtosubject) | Publishes a new message to a NATS subject |
+| [FetchMetadata](#fetchmetadata) | Retrieves metadata from the cluster |
+| [FetchPartitionMetadata](#fetchpartitionmetadata) | Retrieves partition metadata from the partition leader |
+| [SetCursor](#setcursor) | Persists a cursor position for a particular stream partition. |
+| [FetchCursor](#fetchcursor) | Retrieves a cursor position for a particular stream partition. |
+| [Close](#close) | Closes any client connections to Liftbridge |
 
 Below is the interface definition of the Go Liftbridge client. We'll walk
 through each of these operations in more detail below.
@@ -63,13 +66,22 @@ type Client interface {
 	// stream identifier, globally unique.
 	DeleteStream(ctx context.Context, name string) error
 
-    // PauseStream pauses a stream and some or all of its partitions. Name is
+	// PauseStream pauses a stream and some or all of its partitions. Name is
 	// the stream identifier, globally unique. It returns an ErrNoSuchPartition
 	// if the given stream or partition does not exist. By default, this will
 	// pause all partitions. A partition is resumed when it is published to via
 	// the Liftbridge Publish API or ResumeAll is enabled and another partition
 	// in the stream is published to.
 	PauseStream(ctx context.Context, name string, opts ...PauseOption) error
+
+	// SetStreamReadonly sets the readonly flag on a stream and some or all of
+	// its partitions. Name is the stream identifier, globally unique. It
+	// returns an ErrNoSuchPartition if the given stream or partition does not
+	// exist. By default, this will set the readonly flag on all partitions.
+	// Subscribers to a readonly partition will see their subscription ended
+	// with a ErrReadonlyPartition error once all messages currently in the
+	// partition have been read.
+	SetStreamReadonly(ctx context.Context, name string, opts ...ReadonlyOption) error
 
 	// Subscribe creates an ephemeral subscription for the given stream. It
 	// begins receiving messages starting at the configured position and waits
@@ -87,12 +99,14 @@ type Client interface {
 	// To publish directly to a specific NATS subject, use the low-level
 	// PublishToSubject API.
 	//
-	// If the AckPolicy is not NONE and a deadline is provided, this will
-	// synchronously block until the ack is received. If the ack is not
-	// received in time, a DeadlineExceeded status code is returned. If an
-	// AckPolicy and deadline are configured, this returns the Ack on success,
-	// otherwise it returns nil.
+	// If the AckPolicy is not NONE, this will synchronously block until the
+	// ack is received. If the ack is not received in time, ErrAckTimeout is
+	// returned. If AckPolicy is NONE, this returns nil on success.
 	Publish(ctx context.Context, stream string, value []byte, opts ...MessageOption) (*Ack, error)
+
+	// PublishAsync publishes a new message to the Liftbridge stream and
+	// asynchronously processes the ack or error for the message.
+	PublishAsync(ctx context.Context, stream string, value []byte, ackHandler AckHandler, opts ...MessageOption) error
 
 	// PublishToSubject publishes a new message to the NATS subject. Note that
 	// because this publishes directly to a subject, there may be multiple (or
@@ -102,14 +116,23 @@ type Client interface {
 	//
 	// If the AckPolicy is not NONE and a deadline is provided, this will
 	// synchronously block until the first ack is received. If an ack is not
-	// received in time, a DeadlineExceeded status code is returned. If an
-	// AckPolicy and deadline are configured, this returns the first Ack on
-	// success, otherwise it returns nil.
+	// received in time, ErrAckTimeout is returned. If an AckPolicy and
+	// deadline are configured, this returns the first Ack on success,
+	// otherwise it returns nil.
 	PublishToSubject(ctx context.Context, subject string, value []byte, opts ...MessageOption) (*Ack, error)
 
 	// FetchMetadata returns cluster metadata including broker and stream
 	// information.
 	FetchMetadata(ctx context.Context) (*Metadata, error)
+
+	// SetCursor persists a cursor position for a particular stream partition.
+	// This can be used to checkpoint a consumer's position in a stream to
+	// resume processing later.
+	SetCursor(ctx context.Context, id, stream string, partition int32, offset int64) error
+
+	// FetchCursor retrieves a cursor position for a particular stream
+	// partition. It returns -1 if the cursor does not exist.
+	FetchCursor(ctx context.Context, id, stream string, partition int32) (int64, error)
 }
 ```
 
@@ -155,6 +178,14 @@ configure a stream. Supported options are:
 | MaxReplication | bool | Sets the stream replication factor equal to the current number of servers in the cluster. This means all partitions for the stream will be fully replicated within the cluster. | false |
 | ReplicationFactor | int | Sets the replication factor for the stream. The replication factor controls the number of servers a stream's partitions should be replicated to. For example, a value of 1 would mean only 1 server would have the data, and a value of 3 would mean 3 servers would have it. A value of -1 will signal to the server to set the replication factor equal to the current number of servers in the cluster (i.e. MaxReplication). | 1 |
 | Partitions | int | Sets the number of partitions for the stream. | 1 |
+| RetentionMaxBytes | int64 | The maximum size a stream's log can grow to, in bytes, before we will discard old log segments to free up space. A value of 0 indicates no limit. If this is not set, it takes the server default. |  |
+| RetentionMaxMessages | int64 | The maximum size a stream's log can grow to, in number of messages, before we will discard old log segments to free up space. A value of 0 indicates no limit. If this is not set, it takes the server default. |  |
+| RetentionMaxAge | time duration | The TTL for stream log segment files, after which they are deleted. A value of 0 indicates no TTL. If this is not set, it takes the server default.  |  |
+| CleanerInterval | time duration | The frequency to check if a new stream log segment file should be rolled and whether any segments are eligible for deletion based on the retention policy or compaction if enabled. If this is not set, it takes the server default. |  |
+| SegmentMaxBytes | int64 | The maximum size of a single stream log segment file in bytes. Retention is always done a file at a time, so a larger segment size means fewer files but less granular control over retention. If this is not set, it takes the server default. |  |
+| SegmentMaxAge | time duration | The maximum time before a new stream log segment is rolled out. A value of 0 means new segments will only be rolled when segment.max.bytes is reached. Retention is always done a file at a time, so a larger value means fewer files but less granular control over retention. If this is not set, it takes the server default. |  |
+| CompactMaxGoroutines | int32 | The maximum number of concurrent goroutines to use for compaction on a stream log (only applicable if compact.enabled is true). If this is not set, it takes the server default. |  |
+| CompactEnabled | bool | Enable message compaction by key on the server for this stream. If this is not set, it takes the server default. |  |
 
 `CreateStream` returns/throws an error if the operation fails, specifically
 `ErrStreamExists` if a stream with the given name already exists.
@@ -232,6 +263,46 @@ configure stream pausing. Supported options are:
 
 [Implementation Guidance](#pausestream-implementation)
 
+### SetStreamReadonly
+
+```go
+// SetStreamReadonly sets the readonly flag on a stream and some or all of
+// its partitions. Name is the stream identifier, globally unique. It
+// returns an ErrNoSuchPartition if the given stream or partition does not
+// exist. By default, this will set the readonly flag on all partitions.
+// Subscribers to a readonly partition will see their subscription ended
+// with a ErrReadonlyPartition error once all messages currently in the
+// partition have been read.
+func (c *client) SetStreamReadonly(ctx context.Context, name string, options ...ReadonlyOption) error
+```
+
+`SetStreamReadonly` sets some or all of a stream's partitions as readonly or
+readwrite. Attempting to publish to a readonly partition will result in an
+`ErrReadonlyPartition` error/exception. Subscribers consuming a readonly
+partition will read up to the end of the partition and then receive an
+`ErrReadonlyPartition` error.
+
+In the Go client example above, `SetStreamReadonly` takes three arguments:
+
+| Argument | Type | Description | Required |
+|:----|:----|:----|:----|
+| context | context | A [context](https://golang.org/pkg/context/#Context) which is a Go idiom for passing things like a timeout, cancellation signal, and other values across API boundaries. For Liftbridge, this is primarily used for two things: request timeouts and cancellation. In other languages, this might be replaced by explicit arguments, optional named arguments, or other language-specific idioms. | language-dependent |
+| name | string | The name of the stream whose partitions to set the readonly flag for. | yes |
+| options | readonly options | Zero or more readonly options. These are used to pass in optional settings for setting the readonly flag. This is a common [Go pattern](https://dave.cheney.net/2014/10/17/functional-options-for-friendly-apis) for implementing extensible APIs. In other languages, this might be replaced with a builder pattern or optional named arguments. These `SetStreamReadonly` options are described below. | language-dependent |
+
+The readonly options are the equivalent of optional named arguments used to
+configure readonly requests. Supported options are:
+
+| Option | Type | Description | Default |
+|:----|:----|:----|:----|
+| ReadonlyPartitions | list of ints | Specifies the stream partitions to set the readonly flag for. If not set, all partitions will be changed. | |
+| Readonly | bool | Defines if the partitions should be set to readonly or readwrite. | false |
+
+`SetStreamReadonly` returns/throws an error if the operation fails,
+specifically `ErrNoSuchPartition` if the stream or partition(s) do not exist.
+
+[Implementation Guidance](#setstreamreadonly-implementation)
+
 ### Subscribe
 
 ```go
@@ -271,6 +342,9 @@ callback. See [below](#messages-and-acks) for guidance on implementing
 messages.
 
 ```go
+// Handler is the callback invoked by Subscribe when a message is received on
+// the specified stream. If err is not nil, the subscription will be terminated
+// and no more messages will be received.
 type Handler func(msg *Message, err error)
 ```
 
@@ -286,6 +360,7 @@ configure a subscription. Supported options are:
 | StartAtTime | timestamp | Sets the subscription start position to the first message with a timestamp greater than or equal to the given time. | |
 | StartAtTimeDelta | time duration | Sets the subscription start position to the first message with a timestamp greater than or equal to `now - delta`. | |
 | ReadISRReplica | bool | Sets the subscription to one of a random ISR replica instead of subscribing to the partition's leader. | false |
+| Resume | bool | Specifies whether a paused partition should be resumed before subscribing. | false |
 
 Currently, `Subscribe` can only subscribe to a single partition. In the future,
 there will be functionality for consuming all partitions.
@@ -306,12 +381,10 @@ there will be functionality for consuming all partitions.
 // To publish directly to a specific NATS subject, use the low-level
 // PublishToSubject API.
 //
-// If the AckPolicy is not NONE and a deadline is provided, this will
-// synchronously block until the ack is received. If the ack is not
-// received in time, a DeadlineExceeded status code is returned. If an
-// AckPolicy and deadline are configured, this returns the Ack on success,
-// otherwise it returns nil.
-func Publish(ctx context.Context, stream string, value []byte, opts ...MessageOption) (*Ack, error)
+// If the AckPolicy is not NONE, this will synchronously block until the
+// ack is received. If the ack is not received in time, ErrAckTimeout is
+// returned. If AckPolicy is NONE, this returns nil on success.
+Publish(ctx context.Context, stream string, value []byte, opts ...MessageOption) (*Ack, error)
 ```
 
 `Publish` sends a message to a Liftbridge stream. Since Liftbridge streams
@@ -333,6 +406,11 @@ ensuring a message has been stored and replicated, guaranteeing at-least-once
 delivery. The default ack policy is `LEADER`, meaning the ack is sent once the
 partition leader has stored the message. See [below](#messages-and-acks) for
 guidance on implementing acks.
+
+If the ack policy is not `NONE`, `Publish` will synchronously block until the
+ack is received. If the ack is not received in time, an `ErrAckTimeout`
+error/exception is thrown. If the ack policy is `NONE`, this returns
+immediately.
 
 `Publish` can send messages to particular stream partitions using a
 `Partitioner` or an explicitly provided partition. By default, it publishes to
@@ -381,6 +459,55 @@ type Partitioner interface {
 
 [Implementation Guidance](#publish-implementation)
 
+### PublishAsync
+
+```go
+// PublishAsync publishes a new message to the Liftbridge stream and
+// asynchronously processes the ack or error for the message.
+PublishAsync(ctx context.Context, stream string, value []byte, ackHandler AckHandler, opts ...MessageOption) error
+```
+
+`PublishAsync` sends a message to a Liftbridge stream asynchronously. This is
+similar to [`Publish`](#publish), but rather than waiting for the ack, it
+dispatches the ack with an ack handler callback. 
+
+If the ack policy is not `NONE`, `PublishAsync` will asynchronously dispatch
+the ack when it is received. If the ack is not received in time, an
+`ErrAckTimeout` error/exception is dispatched. If the ack policy is `NONE`, the
+callback will not be invoked. If no ack handler is provided, any ack will be
+ignored.
+
+In the Go client example above, `PublishAsync` takes five arguments:
+
+| Argument | Type | Description | Required |
+|:----|:----|:----|:----|
+| context | context | A [context](https://golang.org/pkg/context/#Context) which is a Go idiom for passing things like a timeout, cancellation signal, and other values across API boundaries. For Liftbridge, this is primarily used for two things: request timeouts and cancellation. In other languages, this might be replaced by explicit arguments, optional named arguments, or other language-specific idioms. With `PublishAsync`, the timeout is particularly important as it relates to acking. If an ack policy is set (see below) and a timeout is provided, `PublishAsync` will allow up to this much time to pass until the ack is received. If the ack is not received in time, a timeout error is returned. | language-dependent |
+| stream | string | The stream to publish to. | yes |
+| value | bytes | The message value to publish consisting of opaque bytes. | yes |
+| ackHandler | callback | A handler callback used to receive the ack for the published message, described below. | yes |
+| options | message options | Zero or more message options. These are used to pass in optional settings for the message. This is a common [Go pattern](https://dave.cheney.net/2014/10/17/functional-options-for-friendly-apis) for implementing extensible APIs. In other languages, this might be replaced with a builder pattern or optional named arguments. These `PublishAsync` options are described below. | language-dependent |
+
+The ack handler is a callback function that takes an ack and an error. If the
+error is not null, this indicates the message was not successfully acked and
+the corresponding ack argument will be null. The Go signature of the ack
+handler callback is detailed below. In other languages, this might be a stream
+mechanism instead of a callback. See [below](#messages-and-acks) for guidance
+on implementing acks.
+
+```go
+// AckHandler is used to handle the results of asynchronous publishes to a
+// stream. If the AckPolicy on the published message is not NONE, the handler
+// will receive the ack once it's received from the cluster or an error if the
+// message was not received successfully.
+type AckHandler func(ack *Ack, err error)
+```
+
+The `PublishAsync` message options are the equivalent of optional named
+arguments used to configure a message. Supported options are the same as those
+supported by [`Publish`](#publish).
+
+[Implementation Guidance](#publishasync-implementation)
+
 ### PublishToSubject
 
 ```go
@@ -392,10 +519,10 @@ type Partitioner interface {
 //
 // If the AckPolicy is not NONE and a deadline is provided, this will
 // synchronously block until the first ack is received. If an ack is not
-// received in time, a DeadlineExceeded status code is returned. If an
-// AckPolicy and deadline are configured, this returns the first Ack on
-// success, otherwise it returns nil.
-func PublishToSubject(ctx context.Context, subject string, value []byte, opts ...MessageOption) (*Ack, error)
+// received in time, ErrAckTimeout is returned. If an AckPolicy and
+// deadline are configured, this returns the first Ack on success,
+// otherwise it returns nil.
+PublishToSubject(ctx context.Context, subject string, value []byte, opts ...MessageOption) (*Ack, error)
 ```
 
 `PublishToSubject` sends a message to a NATS subject (and, in turn, any streams
@@ -425,10 +552,10 @@ In the Go client example above, `PublishToSubject` takes four arguments:
 
 | Argument | Type | Description | Required |
 |:----|:----|:----|:----|
-| context | context | A [context](https://golang.org/pkg/context/#Context) which is a Go idiom for passing things like a timeout, cancellation signal, and other values across API boundaries. For Liftbridge, this is primarily used for two things: request timeouts and cancellation. In other languages, this might be replaced by explicit arguments, optional named arguments, or other language-specific idioms. With `Publish`, the timeout is particularly important as it relates to acking. If an ack policy is set (see below) and a timeout is provided, `Publish` will block until the first ack is received. If the ack is not received in time, a timeout error is returned. If the ack policy is `NONE` or a timeout is not set, `Publish` returns as soon as the message has been published. | language-dependent |
+| context | context | A [context](https://golang.org/pkg/context/#Context) which is a Go idiom for passing things like a timeout, cancellation signal, and other values across API boundaries. For Liftbridge, this is primarily used for two things: request timeouts and cancellation. In other languages, this might be replaced by explicit arguments, optional named arguments, or other language-specific idioms. With `PublishToSubject`, the timeout is particularly important as it relates to acking. If an ack policy is set (see below) and a timeout is provided, `PublishToSubject` will block until the first ack is received. If the ack is not received in time, a timeout error is returned. If the ack policy is `NONE` or a timeout is not set, `PublishToSubject` returns as soon as the message has been published. | language-dependent |
 | subject | string | The NATS subject to publish to. | yes |
 | value | bytes | The message value to publish consisting of opaque bytes. | yes |
-| options | message options | Zero or more message options. These are used to pass in optional settings for the message. This is a common [Go pattern](https://dave.cheney.net/2014/10/17/functional-options-for-friendly-apis) for implementing extensible APIs. In other languages, this might be replaced with a builder pattern or optional named arguments. These `Publish` options are described below. | language-dependent |
+| options | message options | Zero or more message options. These are used to pass in optional settings for the message. This is a common [Go pattern](https://dave.cheney.net/2014/10/17/functional-options-for-friendly-apis) for implementing extensible APIs. In other languages, this might be replaced with a builder pattern or optional named arguments. These `PublishToSubject` options are described below. | language-dependent |
 
 The publish message options are the equivalent of optional named arguments used
 to configure a message. Unlike `Publish`, `PublishToSubject` does not support
@@ -583,6 +710,109 @@ In the Go client example above, `FetchMetadata` takes one argument:
 
 [Implementation Guidance](#fetchmetadata-implementation)
 
+### FetchPartitionMetadata
+
+```go
+// FetchPartitionMetadata retrieves the latest partition metadata from partition leader
+// The main interest is to retrieve Highest Watermark and Newest Offset
+FetchPartitionMetadata(ctx context.Context, stream string, partition int32) (*PartitionMetadataResponse, error)
+```
+
+Liftbridge provides a partition metadata API which can be used to retrieve
+information for a partition. Most importantly, there are use cases where it is
+useful to retrieve the high watermark and newest offset of the partition for
+tighter control over subscriptions and published messages. A few key points to
+take into account:
+
+- The client must connect to the partition leader to fetch partition metadata.
+  Only the partition leader maintains the most up-to-date version of the high
+  watermark and newest offset. Thus, the request must be sent to the partition
+  leader.
+- The client should maintain an internal version of the metadata to know, for a
+  given partition of a stream, which broker is currently the leader. It should
+  be noted that the partition leader is different from the cluster's metadata
+  leader.
+
+In the Go client example above, `FetchPartitionMetadata` takes three arguments:
+
+| Argument | Type | Description | Required |
+|:----|:----|:----|:----|
+| context | context | A [context](https://golang.org/pkg/context/#Context) which is a Go idiom for passing things like a timeout, cancellation signal, and other values across API boundaries. For Liftbridge, this is primarily used for two things: request timeouts and cancellation. In other languages, this might be replaced by explicit arguments, optional named arguments, or other language-specific idioms. | language-dependent |
+| stream | string | Stream name | yes |
+| partition | int | ID of the partition | yes |
+
+[Implementation Guidance](#fetchpartitionmetadata-implementation)
+
+### SetCursor
+
+```go
+// SetCursor persists a cursor position for a particular stream partition.
+// This can be used to checkpoint a consumer's position in a stream to
+// resume processing later.
+SetCursor(ctx context.Context, id, stream string, partition int32, offset int64) error
+```
+
+`SetCursor` is used to checkpoint a consumer's position in a stream partition.
+This is useful to allow consumer's to resume processing a stream while
+remaining stateless by using [`FetchCursor`](#fetchcursor).
+
+Because cursors are stored in an internal stream that is partitioned, clients
+need to send this request to the appropriate partition leader. The internal
+cursors stream is partitioned by cursor key. A cursor key consists of
+`<cursorID>,<stream>,<partition>`. To map this key to a partition, hash it with
+an IEEE CRC32 and then mod by the number of partitions in the `__cursors`
+stream. This request mapping should be handled by the client implementation.
+
+`SetCursor` throws an error/exception if the cursors stream does not exist, the
+particular cursors partition does not exist, the server is not the leader for
+the cursors partition, or the server failed to durably store the cursor.
+
+In the Go client example above, `SetCursor` takes five arguments:
+
+| Argument | Type | Description | Required |
+|:----|:----|:----|:----|
+| context | context | A [context](https://golang.org/pkg/context/#Context) which is a Go idiom for passing things like a timeout, cancellation signal, and other values across API boundaries. For Liftbridge, this is primarily used for two things: request timeouts and cancellation. In other languages, this might be replaced by explicit arguments, optional named arguments, or other language-specific idioms. | language-dependent |
+| id | string | Unique cursor identifier | yes |
+| stream | string | Name of stream cursor belongs to | yes |
+| partition | int | ID of the stream partition cursor belongs to | yes |
+| offset | int | Cursor offset position | yes |
+
+[Implementation Guidance](#setcursor-implementation)
+
+### FetchCursor
+
+```go
+// FetchCursor retrieves a cursor position for a particular stream
+// partition. It returns -1 if the cursor does not exist.
+FetchCursor(ctx context.Context, id, stream string, partition int32) (int64, error)
+```
+
+`FetchCursor` is used to retrieve a consumer's position in a stream partition
+stored by [`SetCursor`](#setcursor).  This is useful to allow consumer's to
+resume processing a stream while remaining stateless.
+
+Because cursors are stored in an internal stream that is partitioned, clients
+need to send this request to the appropriate partition leader. The internal
+cursors stream is partitioned by cursor key. A cursor key consists of
+`<cursorID>,<stream>,<partition>`. To map this key to a partition, hash it with
+an IEEE CRC32 and then mod by the number of partitions in the `__cursors`
+stream. This request mapping should be handled by the client implementation.
+
+`FetchCursor` throws an error/exception if the cursors stream does not exist,
+the particular cursors partition does not exist, the server is not the leader
+for the cursors partition, or the server failed to load the cursor.
+
+In the Go client example above, `FetchCursor` takes four arguments:
+
+| Argument | Type | Description | Required |
+|:----|:----|:----|:----|
+| context | context | A [context](https://golang.org/pkg/context/#Context) which is a Go idiom for passing things like a timeout, cancellation signal, and other values across API boundaries. For Liftbridge, this is primarily used for two things: request timeouts and cancellation. In other languages, this might be replaced by explicit arguments, optional named arguments, or other language-specific idioms. | language-dependent |
+| id | string | Unique cursor identifier | yes |
+| stream | string | Name of stream cursor belongs to | yes |
+| partition | int | ID of the stream partition cursor belongs to | yes |
+
+[Implementation Guidance](#fetchcursor-implementation)
+
 ### Close
 
 ```go
@@ -706,13 +936,15 @@ func (a AckPolicy) toProto() proto.AckPolicy {
 // Ack represents an acknowledgement that a message was committed to a stream
 // partition.
 type Ack struct {
-	stream           string
-	partitionSubject string
-	messageSubject   string
-	offset           int64
-	ackInbox         string
-	correlationID    string
-	ackPolicy        AckPolicy
+	stream             string
+	partitionSubject   string
+	messageSubject     string
+	offset             int64
+	ackInbox           string
+	correlationID      string
+	ackPolicy          AckPolicy
+	receptionTimestamp time.Time
+	commitTimestamp    time.Time
 }
 
 func ackFromProto(wireAck *proto.Ack) *Ack {
@@ -720,13 +952,15 @@ func ackFromProto(wireAck *proto.Ack) *Ack {
 		return nil
 	}
 	ack := &Ack{
-		stream:           wireAck.GetStream(),
-		partitionSubject: wireAck.GetPartitionSubject(),
-		messageSubject:   wireAck.GetMsgSubject(),
-		offset:           wireAck.GetOffset(),
-		ackInbox:         wireAck.GetAckInbox(),
-		correlationID:    wireAck.GetCorrelationId(),
-		ackPolicy:        AckPolicy(wireAck.GetAckPolicy()),
+		stream:             wireAck.GetStream(),
+		partitionSubject:   wireAck.GetPartitionSubject(),
+		messageSubject:     wireAck.GetMsgSubject(),
+		offset:             wireAck.GetOffset(),
+		ackInbox:           wireAck.GetAckInbox(),
+		correlationID:      wireAck.GetCorrelationId(),
+		ackPolicy:          AckPolicy(wireAck.GetAckPolicy()),
+		receptionTimestamp: time.Unix(0, wireAck.GetReceptionTimestamp()),
+		commitTimestamp:    time.Unix(0, wireAck.GetCommitTimestamp()),
 	}
 	return ack
 }
@@ -765,6 +999,38 @@ func (a *Ack) CorrelationID() string {
 func (a *Ack) AckPolicy() AckPolicy {
 	return a.ackPolicy
 }
+
+// ReceptionTimestamp is the timestamp the message was received by the server.
+func (a *Ack) ReceptionTimestamp() time.Time {
+	return a.receptionTimestamp
+}
+
+// CommitTimestamp is the timestamp the message was committed.
+func (a *Ack) CommitTimestamp() time.Time {
+	return a.commitTimestamp
+}
+```
+
+With [`PublishAsync`](#publishasync), the server can also send back `PublishResponse` messages
+containing a `PublishAsyncError` in the event of a failed publish. Similar to
+`Ack`, client implementations should wrap this error object before exposing it
+to the user. An example of this is shown in the Go implementation
+`asyncErrorFromProto` below.
+
+```go
+func asyncErrorFromProto(asyncError *proto.PublishAsyncError) error {
+	if asyncError == nil {
+		return nil
+	}
+	switch asyncError.Code {
+	case proto.PublishAsyncError_NOT_FOUND:
+		return ErrNoSuchPartition
+	case proto.PublishAsyncError_READONLY:
+		return ErrReadonlyPartition
+	default:
+		return errors.New(asyncError.Message)
+	}
+}
 ```
 
 ### RPCs
@@ -784,7 +1050,7 @@ idempotency reasons. This resilient RPC method can be used for RPCs such as:
 - `CreateStream`
 - `DeleteStream`
 - `PauseStream`
-- `Publish`
+- `SetStreamReadonly`
 - `PublishToSubject`
 - `FetchMetadata`
 
@@ -845,6 +1111,55 @@ func (c *client) dialBroker() (*grpc.ClientConn, error) {
 }
 ```
 
+Additionally, RPCs such as `SetCursor`, `FetchCursor`, and
+`FetchPartitionMetadata` cannot be sent to any random server but, rather, need
+to be sent to leaders of particular partitions. Thus, it's also useful to
+implement a variant of `doResilientRPC` for sending RPCs to partition leaders
+in a fault-tolerant fashion. The Go implementation of this is called
+`doResilientLeaderRPC` and is shown below.
+
+```go
+// doResilientLeaderRPC sends the given RPC to the partition leader and
+// performs retries if it fails due to the broker being unavailable.
+func (c *client) doResilientLeaderRPC(ctx context.Context, rpc func(client proto.APIClient) error,
+	stream string, partition int32) (err error) {
+
+	var (
+		pool *connPool
+		addr string
+		conn *conn
+	)
+	for i := 0; i < 5; i++ {
+		pool, addr, err = c.getPoolAndAddr(stream, partition, false)
+		if err != nil {
+			time.Sleep(50 * time.Millisecond)
+			c.metadata.update(ctx)
+			continue
+		}
+		conn, err = pool.get(c.connFactory(addr))
+		if err != nil {
+			time.Sleep(50 * time.Millisecond)
+			c.metadata.update(ctx)
+			continue
+		}
+		err = rpc(conn)
+		pool.put(conn)
+		if err != nil {
+			if status.Code(err) == codes.Unavailable {
+				time.Sleep(50 * time.Millisecond)
+				c.metadata.update(ctx)
+				continue
+			}
+		}
+		break
+	}
+	return err
+}
+```
+
+`getPoolAndAddr` is a helper which returns a connection pool and the address
+for the leader of the given partition.
+
 ### Connection Pooling
 
 A single client might have multiple connections to different servers in a
@@ -883,6 +1198,49 @@ it using the [resilient RPC method](#rpcs) described above. If the
 `AlreadyExists` gRPC error is returned, an `ErrStreamExists` error/exception is
 thrown. Otherwise, any other error/exception is thrown if the operation failed.
 
+Also, clients can set custom configurations for the stream to be created. The
+exhaustive list of supported stream configurations are:
+
+```plaintext
+RetentionMaxBytes
+RetentionMaxMessages
+RetentionMaxAge
+CleanerInterval
+SegmentMaxBytes
+SegmentMaxAge
+CompactEnabled
+CompactMaxGoroutines
+```
+
+Refer to [Stream Configuration](configuration.md#streams-configuration-settings)
+for more details. Note that these settings are optional. If not provided, the
+default configurations of the broker will be used instead. 
+
+In order to differentiate between custom configuration specified by the user
+and the server's default configuration, we use 3 custom `NullableType` wrappers
+in setting options for the `CreateStreamRequest`. These custom types are:
+
+```proto
+message NullableInt64 {
+    int64 value = 1; 
+}
+
+message NullableInt32 {
+    int32 value = 1; 
+}
+
+message NullableBool {
+    bool value = 1; 
+}
+
+```
+
+Note: if `CompactMaxGoroutines` is configured, you have to make sure manually
+that `CompactEnabled` is also set. The reason is that if this is not enabled
+explicitly, the servier will use the default configuration and that may be to
+disable compaction on the service side, which renders `CompactMaxGoroutines` to
+be unused.
+
 ```go
 // CreateStream creates a new stream attached to a NATS subject. Subject is the
 // NATS subject the stream is attached to, and name is the stream identifier,
@@ -896,13 +1254,7 @@ func (c *client) CreateStream(ctx context.Context, subject, name string, options
 		}
 	}
 
-	req := &proto.CreateStreamRequest{
-		Subject:           subject,
-		Name:              name,
-		ReplicationFactor: opts.ReplicationFactor,
-		Group:             opts.Group,
-		Partitions:        opts.Partitions,
-	}
+	req := opts.newRequest(subject, name)
 	err := c.doResilientRPC(func(client proto.APIClient) error {
 		_, err := client.CreateStream(ctx, req)
 		return err
@@ -913,6 +1265,9 @@ func (c *client) CreateStream(ctx context.Context, subject, name string, options
 	return err
 }
 ```
+
+`StreamOptions.newRequest` creates a `CreateStreamRequest` protobuf and applies
+the specified options to it.
 
 ### DeleteStream Implementation
 
@@ -966,6 +1321,46 @@ func (c *client) PauseStream(ctx context.Context, name string, options ...PauseO
 	}
 	err := c.doResilientRPC(func(client proto.APIClient) error {
 		_, err := client.PauseStream(ctx, req)
+		return err
+	})
+	if status.Code(err) == codes.NotFound {
+		return ErrNoSuchPartition
+	}
+	return err
+}
+```
+
+### SetStreamReadonly Implementation
+
+The `SetStreamReadonly` implementation simply constructs a gRPC request and
+executes it using the [resilient RPC method](#rpcs) described above. If the
+`NotFound` gRPC error is returned, an `ErrNoSuchPartition` error/exception is
+thrown.  Otherwise, any other error/exception is thrown if the operation
+failed.
+
+```go
+// SetStreamReadonly sets the readonly flag on a stream and some or all of
+// its partitions. Name is the stream identifier, globally unique. It
+// returns an ErrNoSuchPartition if the given stream or partition does not
+// exist. By default, this will set the readonly flag on all partitions.
+// Subscribers to a readonly partition will see their subscription ended
+// with a ErrReadonlyPartition error once all messages currently in the
+// partition have been read.
+func (c *client) SetStreamReadonly(ctx context.Context, name string, options ...ReadonlyOption) error {
+	opts := &ReadonlyOptions{}
+	for _, opt := range options {
+		if err := opt(opts); err != nil {
+			return err
+		}
+	}
+
+	req := &proto.SetStreamReadonlyRequest{
+		Name:       name,
+		Partitions: opts.Partitions,
+		Readonly:   !opts.Readwrite,
+	}
+	err := c.doResilientRPC(func(client proto.APIClient) error {
+		_, err := client.SetStreamReadonly(ctx, req)
 		return err
 	})
 	if status.Code(err) == codes.NotFound {
@@ -1060,11 +1455,19 @@ of behavior to point out with the dispatching component:
 
 ### Publish Implementation
 
-`Publish` involves constructing a `Message` protobuf, determining the partition
-to publish to, and then making the publish request to the server using the
-[resilient RPC method](#rpcs) described above. The Go implementation of this is
-shown below, including a `partition` helper function which determines the
-partition ID to publish the message to.
+`Publish` originally used the `Publish` RPC endpoint. This endpoint will be
+deprecated in a future version of Liftbridge. Instead, `Publish` should rely on
+the `PublishAsync` streaming endpoint and wrap it with synchronous logic. Refer
+to the [`PublishAsync` implementation](#publishasync-implementation) for
+guidance on implementing the asynchronous component. The remainder of this
+builds on that implementation.
+
+`Publish` relies on a private `publishAsync` helper function by synchronously
+waiting for the dispatched ack. If the ack policy is `NONE`, the message is
+published while ignoring the ack. Otherwise, `Publish` waits for the ack or
+error dispatched by `publishAsync`. The Go implementation of this is shown
+below. Refer to the [`PublishAsync` implementation](#publishasync-implementation)
+for the implementation of `publishAsync`.
 
 ```go
 // Publish publishes a new message to the Liftbridge stream. The partition that
@@ -1074,11 +1477,9 @@ partition ID to publish the message to.
 // underlying NATS subject that gets published to.  To publish directly to a
 // spedcific NATS subject, use the low-level PublishToSubject API.
 //
-// If the AckPolicy is not NONE and a deadline is provided, this will
-// synchronously block until the ack is received. If the ack is not received in
-// time, a DeadlineExceeded status code is returned. If an AckPolicy and
-// deadline are configured, this returns the Ack on success, otherwise it
-// returns nil.
+// If the AckPolicy is not NONE, this will synchronously block until the ack is
+// received. If the ack is not received in time, ErrAckTimeout is returned. If
+// AckPolicy is NONE, this returns nil on success.
 func (c *client) Publish(ctx context.Context, stream string, value []byte,
 	options ...MessageOption) (*Ack, error) {
 
@@ -1087,13 +1488,245 @@ func (c *client) Publish(ctx context.Context, stream string, value []byte,
 		opt(opts)
 	}
 
+	if opts.AckPolicy == AckPolicy(proto.AckPolicy_NONE) {
+		// Fire and forget.
+		err := c.publishAsync(ctx, stream, value, nil, opts)
+		return nil, err
+	}
+
+	// Publish and wait for ack.
+	var (
+		ackCh   = make(chan *Ack, 1)
+		errorCh = make(chan error, 1)
+	)
+	err := c.publishAsync(ctx, stream, value, func(ack *Ack, err error) {
+		if err != nil {
+			errorCh <- err
+			return
+		}
+		ackCh <- ack
+	}, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	select {
+	case ack := <-ackCh:
+		return ack, nil
+	case err := <-errorCh:
+		return nil, err
+	}
+}
+```
+
+### PublishAsync Implementation
+
+The `PublishAsync` RPC endpoint is a bidirectional streaming API. This means
+both the client can continually send new messages to the server and the server
+can continually send acks back to the client. This requires the client to have
+a background connection to a server in the cluster for handling asynchronous
+publishes. This also requires a long-running process for dispatching acks
+received from the server. We recommend initializing a dedicated gRPC connection
+for `PublishAsync` and starting a background thread for dispatching acks when
+the client is initialized. In the Go implementation, we start a `dispatchAcks`
+goroutine, shown below, which receives acks from the server and dispatches the
+appropriate callback. `PublishResponse`, the message sent by the server, also
+includes a `PublishAsyncError`. This is set if an async publish failed, e.g.
+because the partition published to does not exist.
+
+Since the `PublishAsync` RPC is a long-lived streaming endpoint, it's possible
+for the connection to be disrupted, such as in the case of a server failure.
+Therefore, it's important that this connection be re-established in the event
+of a disconnection. Note that there are two different threads of execution
+which use the `PublishAsync` connection concurrently, one for publishing
+messages and one for receiving acks. To simplify the reconnect logic, we
+recommend handling the reconnect only on the ack dispatch side. This also has
+the added benefit of avoiding duplicate deliveries in the event of a disconnect
+during publish. Thus, it's up to end users to implement retries around publish
+in order to handle these types of transient failures. The Go implementation of
+`dispatchAcks` along with a helper function for re-establishing the
+`PublishAsync` connection called `newAsyncStream` is shown below.
+
+```go
+func (c *client) dispatchAcks() {
+	c.mu.RLock()
+	asyncStream := c.asyncStream
+	c.mu.RUnlock()
+	for {
+		resp, err := asyncStream.Recv()
+		if err == io.EOF {
+			return
+		}
+		if err != nil {
+			stream, ok := c.newAsyncStream()
+			if !ok {
+				return
+			}
+			asyncStream = stream
+			c.mu.Lock()
+			c.asyncStream = stream
+			c.mu.Unlock()
+			continue
+		}
+
+		var correlationID string
+		if resp.AsyncError != nil {
+			correlationID = resp.CorrelationId
+		} else if resp.Ack != nil {
+			// TODO: Use resp.CorrelationId once Ack.CorrelationId is removed.
+			correlationID = resp.Ack.CorrelationId
+		}
+		ctx := c.removeAckContext(correlationID)
+		if ctx != nil && ctx.handler != nil {
+			ctx.handler(ackFromProto(resp.Ack), asyncErrorFromProto(resp.AsyncError))
+		}
+	}
+}
+
+func (c *client) newAsyncStream() (stream proto.API_PublishAsyncClient, ok bool) {
+	for {
+		err := c.doResilientRPC(func(client proto.APIClient) error {
+			resp, err := client.PublishAsync(context.Background())
+			if err != nil {
+				return err
+			}
+			stream = resp
+			return nil
+		})
+		if err == nil {
+			return stream, true
+		}
+		if c.isClosed() {
+			return nil, false
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+```
+
+Recall that `dispatchAcks` is invoked as a long-running goroutine on client
+initialization. The client also maintains a mapping of correlation ID to
+`ackContext`, which is a struct used to store a timer and ack handler for a
+given message. When an ack is received from the server, its `ackContext` is
+removed from the map and the handler callback is invoked. The timer is used to
+implement an ack timeout, which similarly invokes the handler callback but with
+an error instead of the ack.
+
+```go
+// ackContext tracks state for an in-flight message expecting an ack.
+type ackContext struct {
+	handler AckHandler
+	timer   *time.Timer
+}
+
+func (c *client) removeAckContext(cid string) *ackContext {
+	var timer *time.Timer
+	c.mu.Lock()
+	ctx := c.ackContexts[cid]
+	if ctx != nil {
+		timer = ctx.timer
+		delete(c.ackContexts, cid)
+	}
+	c.mu.Unlock()
+	// Cancel ack timeout if any.
+	if timer != nil {
+		timer.Stop()
+	}
+	return ctx
+}
+```
+
+So far, we have covered how the `PublishAsync` streaming connection is managed
+and how acks are dispatched. Now we will look at the actual publish
+implementation. Both [`Publish`](#publish-implementation) and `PublishAsync`
+rely on a private `publishAsync` helper function.
+
+```go
+// PublishAsync publishes a new message to the Liftbridge stream and
+// asynchronously processes the ack or error for the message.
+func (c *client) PublishAsync(ctx context.Context, stream string, value []byte,
+	ackHandler AckHandler, options ...MessageOption) error {
+
+	opts := &MessageOptions{Headers: make(map[string][]byte)}
+	for _, opt := range options {
+		opt(opts)
+	}
+	return c.publishAsync(ctx, stream, value, ackHandler, opts)
+}
+```
+
+This `publishAsync` helper function handles assigning a correlation ID to the
+message options (if one is not specified) and constructs a `PublishRequest` for
+sending to the server. It then sets up the `ackContext` and sends the
+`PublishRequest` to the server using the `PublishAsync` gRPC stream. There is a
+client option for configuring a global ack timeout for publishes called
+`AckWaitTime`. This can be overridden on individual publishes. In the Go
+implementation, shown below, this is done via the `Context` deadline.
+
+```go
+func (c *client) publishAsync(ctx context.Context, stream string, value []byte,
+	ackHandler AckHandler, opts *MessageOptions) error {
+
+	if opts.CorrelationID == "" {
+		opts.CorrelationID = nuid.Next()
+	}
+
+	req, err := c.newPublishRequest(ctx, stream, value, opts)
+	if err != nil {
+		return err
+	}
+
+	c.mu.Lock()
+	asyncStream := c.asyncStream
+	if ackHandler != nil {
+		// Setup ack timeout.
+		var (
+			timeout      = c.opts.AckWaitTime
+			deadline, ok = ctx.Deadline()
+		)
+		if ok {
+			timeout = time.Until(deadline)
+		}
+		ack := &ackContext{
+			handler: ackHandler,
+			timer: time.AfterFunc(timeout, func() {
+				ackCtx := c.removeAckContext(req.CorrelationId)
+				// Ack was processed before timeout finished.
+				if ackCtx == nil {
+					return
+				}
+				if ackCtx.handler != nil {
+					ackCtx.handler(nil, ErrAckTimeout)
+				}
+			}),
+		}
+		c.ackContexts[req.CorrelationId] = ack
+	}
+	c.mu.Unlock()
+
+	if err := asyncStream.Send(req); err != nil {
+		c.removeAckContext(req.CorrelationId)
+		return err
+	}
+
+	return nil
+}
+```
+
+`newPublishRequest` determines which stream partition to publish to using the
+`partition` helper and then constructs the `PublishRequest`.
+
+```go
+func (c *client) newPublishRequest(ctx context.Context, stream string, value []byte,
+	opts *MessageOptions) (*proto.PublishRequest, error) {
+
 	// Determine which partition to publish to.
 	partition, err := c.partition(ctx, stream, opts.Key, value, opts)
 	if err != nil {
 		return nil, err
 	}
 
-	req := &proto.PublishRequest{
+	return &proto.PublishRequest{
 		Stream:        stream,
 		Partition:     partition,
 		Key:           opts.Key,
@@ -1101,17 +1734,7 @@ func (c *client) Publish(ctx context.Context, stream string, value []byte,
 		AckInbox:      opts.AckInbox,
 		CorrelationId: opts.CorrelationID,
 		AckPolicy:     opts.AckPolicy.toProto(),
-	}
-
-	var ack *proto.Ack
-	err = c.doResilientRPC(func(client proto.APIClient) error {
-		resp, err := client.Publish(ctx, req)
-		if err == nil {
-			ack = resp.Ack
-		}
-		return err
-	})
-	return ackFromProto(ack), err
+	}, nil
 }
 
 // partition determines the partition ID to publish the message to. If a
@@ -1143,13 +1766,6 @@ The partition to publish to is determined in the following way:
    option, use it.
 2. If a `Partitioner` is provided, use it to compute the partition.
 3. If neither of the above apply, use partition 0 (the default partition).
-
-Note that `Publish` is a synchronous operation. After the RPC returns, the
-message has been published. The server handles message acks, if applicable. If
-a publish is expecting an ack, the RPC will block until the ack is received or
-a timeout occurs. Implementations may choose to also offer an asynchronous
-publish API for performance reasons. The Go client does not currently implement
-this.
 
 #### Partitioner Implementation
 
@@ -1218,11 +1834,11 @@ func (r *roundRobinPartitioner) Partition(stream string, key, value []byte, meta
 
 ### PublishToSubject Implementation
 
-`PublishToSubject` implementation is similar to that of
-[`Publish`](#publish-implementation) but instead sends a
-`PublishToSubjectRequest` to the `PublishToSubject` endpoint. This sets the
-publish subject directly rather than computing a partition for a stream. The Go
-implementation of this is shown below:
+`PublishToSubject` sends a `PublishToSubjectRequest` to the `PublishToSubject`
+endpoint using the using the [resilient RPC method](#rpcs) described above.
+Unlike [`Publish`](#publish-implementation) and [`PublishAsync`](#publishasync-implementation),
+this sets the publish subject directly rather than computing a partition for a
+stream. The Go implementation of this is shown below:
 
 ```go
 // PublishToSubject publishes a new message to the NATS subject. Note that
@@ -1233,9 +1849,9 @@ implementation of this is shown below:
 //
 // If the AckPolicy is not NONE and a deadline is provided, this will
 // synchronously block until the first ack is received. If an ack is not
-// received in time, a DeadlineExceeded status code is returned. If an
-// AckPolicy and deadline are configured, this returns the first Ack on
-// success, otherwise it returns nil.
+// received in time, ErrAckTimeout is returned. If an AckPolicy and deadline
+// are configured, this returns the first Ack on success, otherwise it returns
+// nil.
 func (c *client) PublishToSubject(ctx context.Context, subject string, value []byte,
 	options ...MessageOption) (*Ack, error) {
 
@@ -1253,6 +1869,16 @@ func (c *client) PublishToSubject(ctx context.Context, subject string, value []b
 		AckPolicy:     opts.AckPolicy.toProto(),
 	}
 
+	// Setup ack timeout.
+	var (
+		cancel func()
+		_, ok  = ctx.Deadline()
+	)
+	if !ok {
+		ctx, cancel = context.WithTimeout(ctx, c.opts.AckWaitTime)
+		defer cancel()
+	}
+
 	var ack *proto.Ack
 	err := c.doResilientRPC(func(client proto.APIClient) error {
 		resp, err := client.PublishToSubject(ctx, req)
@@ -1261,6 +1887,9 @@ func (c *client) PublishToSubject(ctx context.Context, subject string, value []b
 		}
 		return err
 	})
+	if status.Code(err) == codes.DeadlineExceeded {
+		err = ErrAckTimeout
+	}
 	return ackFromProto(ack), err
 }
 ```
@@ -1327,6 +1956,114 @@ the partition leader. It may also be prudent for clients to periodically
 refresh metadata irrespective of these types of errors, perhaps with a
 configurable interval. However, the Go client does not currently implement
 this.
+
+### FetchPartitionMetadata Implementation
+
+`FetchPartitionMetadata` should return an immutable object which exposes
+partition metadata. 
+
+*NOTE*: *It is important to keep in mind that the
+`FetchPartitionMetadataRequest` should be sent only to the partition leader. It
+is the job of the client to figure out which broker is currently the partition
+leader. `Metadata` can be used to figure out which broker is currently the
+leader of the requested partition*. In Go, this is implemented using a variant
+of the [resilient RPC method](#rpcs) described above.
+
+The object contains information of the partition, notably the high watermark
+and newest offset, which is necessary in case the client wants tighter control
+over the subscription/publication of messages.
+
+### SetCursor Implementation
+
+The `SetCursor` implementation simply constructs a gRPC request and
+executes it using the [resilient leader RPC method](#rpcs) described above.
+This requires mapping the cursor to a partition in the internal `__cursors`
+stream. A cursor is mapped to a partition using its key. The cursor key
+consists of `<cursorID>.<stream>.<partition>`. This key is then hashed using
+IEEE CRC32 and modded by the number of partitions in the `__cursors` stream.
+The Go implementation of this is shown below.
+
+```go
+// SetCursor persists a cursor position for a particular stream partition.
+// This can be used to checkpoint a consumer's position in a stream to resume
+// processing later.
+func (c *client) SetCursor(ctx context.Context, id, stream string, partition int32, offset int64) error {
+	req := &proto.SetCursorRequest{
+		Stream:    stream,
+		Partition: partition,
+		CursorId:  id,
+		Offset:    offset,
+	}
+	cursorsPartition, err := c.getCursorsPartition(ctx, c.getCursorKey(id, stream, partition))
+	if err != nil {
+		return err
+	}
+	return c.doResilientLeaderRPC(ctx, func(client proto.APIClient) error {
+		_, err := client.SetCursor(ctx, req)
+		return err
+	}, cursorsStream, cursorsPartition)
+}
+
+func (c *client) getCursorKey(cursorID, streamName string, partitionID int32) []byte {
+	return []byte(fmt.Sprintf("%s,%s,%d", cursorID, streamName, partitionID))
+}
+
+func (c *client) getCursorsPartition(ctx context.Context, cursorKey []byte) (int32, error) {
+	// Make sure we have metadata for the cursors stream and, if not, update it.
+	metadata, err := c.waitForStreamMetadata(ctx, cursorsStream)
+	if err != nil {
+		return 0, err
+	}
+
+	stream := metadata.GetStream(cursorsStream)
+	if stream == nil {
+		return 0, errors.New("cursors stream does not exist")
+	}
+
+	return int32(hasher(cursorKey) % uint32(len(stream.Partitions()))), nil
+}
+```
+
+### FetchCursor Implementation
+
+The `FetchCursor` implementation simply constructs a gRPC request and
+executes it using the [resilient leader RPC method](#rpcs) described above.
+This requires mapping the cursor to a partition in the internal `__cursors`
+stream. A cursor is mapped to a partition using its key. The cursor key
+consists of `<cursorID>.<stream>.<partition>`. This key is then hashed using
+IEEE CRC32 and modded by the number of partitions in the `__cursors` stream.
+The Go implementation of this is shown below.
+
+```go
+// FetchCursor retrieves a cursor position for a particular stream partition.
+// It returns -1 if the cursor does not exist.
+func (c *client) FetchCursor(ctx context.Context, id, stream string, partition int32) (int64, error) {
+	var (
+		req = &proto.FetchCursorRequest{
+			Stream:    stream,
+			Partition: partition,
+			CursorId:  id,
+		}
+		offset int64
+	)
+	cursorsPartition, err := c.getCursorsPartition(ctx, c.getCursorKey(id, stream, partition))
+	if err != nil {
+		return 0, err
+	}
+	err = c.doResilientLeaderRPC(ctx, func(client proto.APIClient) error {
+		resp, err := client.FetchCursor(ctx, req)
+		if err != nil {
+			return err
+		}
+		offset = resp.Offset
+		return nil
+	}, cursorsStream, cursorsPartition)
+	return offset, err
+}
+```
+
+The `getCursorKey` and `getCursorsPartition` helper implementations are shown
+[above](#setcursor-implementation).
 
 ### Close Implementation
 

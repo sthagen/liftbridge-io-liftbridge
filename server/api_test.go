@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	lift "github.com/liftbridge-io/go-liftbridge"
+	lift "github.com/liftbridge-io/go-liftbridge/v2"
 	natsdTest "github.com/nats-io/nats-server/v2/test"
 	"github.com/nats-io/nats.go"
 	"github.com/stretchr/testify/require"
@@ -337,7 +337,6 @@ func TestSubscribeStreamNotLeader(t *testing.T) {
 	err = client2.Subscribe(context.Background(), name,
 		func(msg *lift.Message, err error) {
 			require.NoError(t, err)
-			fmt.Println("receiving msg")
 		}, lift.ReadISRReplica())
 	require.NoError(t, err)
 }
@@ -642,6 +641,67 @@ func TestStreamPublishSubscribe(t *testing.T) {
 	}
 }
 
+// Ensure legacy Publish endpoint works.
+func TestLegacyPublish(t *testing.T) {
+	defer cleanupStorage(t)
+
+	// Use a central NATS server.
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	// Configure server.
+	s1Config := getTestConfig("a", true, 5050)
+	s1 := runServerWithConfig(t, s1Config)
+	defer s1.Stop()
+
+	getMetadataLeader(t, 10*time.Second, s1)
+
+	client, err := lift.Connect([]string{"localhost:5050"})
+	require.NoError(t, err)
+	defer client.Close()
+
+	name := "foo"
+	subject := "foo"
+	err = client.CreateStream(context.Background(), subject, name, lift.Partitions(2))
+	require.NoError(t, err)
+
+	conn, err := grpc.Dial("localhost:5050", grpc.WithInsecure())
+	require.NoError(t, err)
+	apiClient := proto.NewAPIClient(conn)
+
+	// Publishing with no stream returns an error.
+	_, err = apiClient.Publish(context.Background(), &proto.PublishRequest{})
+	require.Error(t, err)
+	require.Equal(t, codes.InvalidArgument, status.Convert(err).Code())
+
+	// Publishing to non-existant stream returns an error.
+	_, err = apiClient.Publish(context.Background(), &proto.PublishRequest{
+		Stream: "bar",
+	})
+	require.Error(t, err)
+	require.Equal(t, codes.NotFound, status.Convert(err).Code())
+
+	// Successful publish returns an ack when AckPolicy is not NONE and a
+	// timeout is set.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	resp, err := apiClient.Publish(ctx, &proto.PublishRequest{
+		Stream:    "foo",
+		Partition: 1,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, resp.Ack)
+
+	// Successful publish returns nil when AckPolicy is NONE.
+	resp, err = apiClient.Publish(context.Background(), &proto.PublishRequest{
+		Stream:    "foo",
+		Partition: 1,
+		AckPolicy: proto.AckPolicy_NONE,
+	})
+	require.NoError(t, err)
+	require.Nil(t, resp.Ack)
+}
+
 // Ensure publishing to a NATS subject works.
 func TestPublishToSubject(t *testing.T) {
 	defer cleanupStorage(t)
@@ -671,7 +731,7 @@ func TestPublishToSubject(t *testing.T) {
 
 	// Publish message to subject.
 	_, err = client.PublishToSubject(context.Background(), "foo.bar", []byte("hello"),
-		lift.Key([]byte("key")))
+		lift.Key([]byte("key")), lift.AckPolicyNone())
 	require.NoError(t, err)
 
 	msg, err := sub.NextMsg(5 * time.Second)
@@ -780,4 +840,443 @@ func TestSubscribePartitionClosed(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("Did not receive expected status")
 	}
+}
+
+func TestSubscribeStopPosition(t *testing.T) {
+	defer cleanupStorage(t)
+
+	// Use a central NATS server.
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	// Configure server.
+	s1Config := getTestConfig("a", true, 5050)
+	s1 := runServerWithConfig(t, s1Config)
+	defer s1.Stop()
+
+	getMetadataLeader(t, 10*time.Second, s1)
+
+	client, err := lift.Connect([]string{"localhost:5050"})
+	require.NoError(t, err)
+	defer client.Close()
+
+	stream := "foo"
+	ctx := context.Background()
+	err = client.CreateStream(ctx, "foo", stream)
+	require.NoError(t, err)
+
+	// subscription to empty stream errors
+	err = client.Subscribe(ctx, stream, nil, lift.StopAtLatestReceived())
+	require.Error(t, err)
+	require.Equal(t, lift.ErrReadonlyPartition, err)
+
+	// publish messages to stream
+	numMessages := 10
+	acks := make([]*lift.Ack, 0, numMessages)
+	for i := 0; i < numMessages; i++ {
+		ack, err := client.Publish(ctx, stream, []byte(strconv.Itoa(i)))
+		require.NoError(t, err)
+		acks = append(acks, ack)
+	}
+
+	exhausted := make(chan struct{})
+
+	// stream should return all message then close
+	receivedCount := 0
+	err = client.Subscribe(ctx, stream, func(msg *lift.Message, err error) {
+		receivedCount++
+
+		// we've recieved all messages so this must be a resource exhaused error
+		if receivedCount > numMessages {
+			require.Error(t, err)
+			require.Equal(t, lift.ErrReadonlyPartition, err)
+			exhausted <- struct{}{}
+		}
+	},
+		lift.StartAtEarliestReceived(),
+		lift.StopAtLatestReceived(),
+	)
+	require.NoError(t, err)
+
+	select {
+	case <-exhausted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stream was not exhausted")
+	}
+
+	// Get all messages between the timestamps of two already acknowledged
+	// messages. Inclusive of the bounds:
+	// 0, 1, 2, 3, 4, 5, 6, 7, 8, 9
+	//      |_____________|
+	start := acks[2]
+	stop := acks[6]
+	expectedCount := 5
+	expectedOffset := start.Offset()
+
+	receivedCount = 0
+	err = client.Subscribe(ctx, stream, func(msg *lift.Message, err error) {
+		receivedCount++
+
+		if msg != nil {
+			require.Equal(t, expectedOffset, msg.Offset())
+			expectedOffset++
+		}
+
+		// we've recieved all messages so this must be a resource exhaused error
+		if receivedCount > expectedCount {
+			require.Error(t, err)
+			require.Equal(t, lift.ErrReadonlyPartition, err)
+			exhausted <- struct{}{}
+		}
+	},
+		lift.StartAtTime(start.ReceptionTimestamp()),
+		lift.StopAtTime(stop.ReceptionTimestamp()),
+	)
+	require.NoError(t, err)
+
+	select {
+	case <-exhausted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stream was not exhausted")
+	}
+}
+
+// Ensure getStreamConfig applies non-nil values from the CreateStreamRequest
+// to the StreamConfig.
+func TestGetStreamConfig(t *testing.T) {
+	req := &proto.CreateStreamRequest{
+		RetentionMaxAge:               &proto.NullableInt64{Value: 1},
+		CleanerInterval:               &proto.NullableInt64{Value: 2},
+		SegmentMaxBytes:               &proto.NullableInt64{Value: 3},
+		SegmentMaxAge:                 &proto.NullableInt64{Value: 4},
+		CompactMaxGoroutines:          &proto.NullableInt32{Value: 5},
+		RetentionMaxBytes:             &proto.NullableInt64{Value: 6},
+		RetentionMaxMessages:          &proto.NullableInt64{Value: 7},
+		CompactEnabled:                &proto.NullableBool{Value: true},
+		AutoPauseTime:                 &proto.NullableInt64{Value: 8},
+		AutoPauseDisableIfSubscribers: &proto.NullableBool{Value: true},
+		MinIsr:                        &proto.NullableInt32{Value: 9},
+	}
+
+	config := getStreamConfig(req)
+
+	require.Equal(t, int64(1), config.RetentionMaxAge.Value)
+	require.Equal(t, int64(2), config.CleanerInterval.Value)
+	require.Equal(t, int64(3), config.SegmentMaxBytes.Value)
+	require.Equal(t, int64(4), config.SegmentMaxAge.Value)
+	require.Equal(t, int32(5), config.CompactMaxGoroutines.Value)
+	require.Equal(t, int64(6), config.RetentionMaxBytes.Value)
+	require.Equal(t, int64(7), config.RetentionMaxMessages.Value)
+	require.True(t, config.CompactEnabled.Value)
+	require.Equal(t, int64(8), config.AutoPauseTime.Value)
+	require.True(t, config.AutoPauseDisableIfSubscribers.Value)
+	require.Equal(t, int32(9), config.MinIsr.Value)
+}
+
+// Ensure SetCursor stores cursors and FetchCursor retrieves them.
+func TestSetFetchCursor(t *testing.T) {
+	defer cleanupStorage(t)
+
+	// Use a central NATS server.
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	// Configure server.
+	s1Config := getTestConfig("a", true, 5050)
+	s1Config.CursorsStream.Partitions = 5
+	s1 := runServerWithConfig(t, s1Config)
+	defer s1.Stop()
+
+	getMetadataLeader(t, 10*time.Second, s1)
+
+	client, err := lift.Connect([]string{"localhost:5050"})
+	require.NoError(t, err)
+	defer client.Close()
+
+	stream := "foo"
+	partition := int32(2)
+	cursorID := "abc"
+
+	err = client.CreateStream(context.Background(), "foo", stream, lift.Partitions(5))
+	require.NoError(t, err)
+
+	// Fetching cursor that doesn't exist returns -1.
+	offset, err := client.FetchCursor(context.Background(), cursorID, stream, partition)
+	require.NoError(t, err)
+	require.Equal(t, int64(-1), offset)
+
+	err = client.SetCursor(context.Background(), "foo", stream, partition, 2)
+	require.NoError(t, err)
+	err = client.SetCursor(context.Background(), cursorID, stream, partition, 5)
+	require.NoError(t, err)
+
+	offset, err = client.FetchCursor(context.Background(), cursorID, stream, partition)
+	require.NoError(t, err)
+	require.Equal(t, int64(5), offset)
+
+	err = client.SetCursor(context.Background(), cursorID, stream, partition, 10)
+	require.NoError(t, err)
+
+	offset, err = client.FetchCursor(context.Background(), cursorID, stream, partition)
+	require.NoError(t, err)
+	require.Equal(t, int64(10), offset)
+
+	require.Error(t, client.SetCursor(context.Background(), "", "foo", 0, 5))
+	require.Error(t, client.SetCursor(context.Background(), "123", "", 0, 5))
+
+	_, err = client.FetchCursor(context.Background(), "", "foo", 0)
+	require.Error(t, err)
+	_, err = client.FetchCursor(context.Background(), "123", "", 0)
+	require.Error(t, err)
+}
+
+// Ensure SetCursor stores cursors and FetchCursor retrieves them even if the
+// cache is empty.
+func TestSetFetchCursorNoCache(t *testing.T) {
+	defer cleanupStorage(t)
+
+	// Use a central NATS server.
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	// Configure server.
+	s1Config := getTestConfig("a", true, 5050)
+	s1Config.CursorsStream.Partitions = 5
+	s1 := runServerWithConfig(t, s1Config)
+	s1.cursors.disableCache = true
+	defer s1.Stop()
+
+	getMetadataLeader(t, 10*time.Second, s1)
+
+	client, err := lift.Connect([]string{"localhost:5050"})
+	require.NoError(t, err)
+	defer client.Close()
+
+	stream := "foo"
+	partition := int32(2)
+	cursorID := "abc"
+
+	err = client.CreateStream(context.Background(), "foo", stream, lift.Partitions(5))
+	require.NoError(t, err)
+
+	err = client.SetCursor(context.Background(), "foo", stream, partition, 2)
+	require.NoError(t, err)
+	err = client.SetCursor(context.Background(), cursorID, stream, partition, 5)
+	require.NoError(t, err)
+
+	offset, err := client.FetchCursor(context.Background(), cursorID, stream, partition)
+	require.NoError(t, err)
+	require.Equal(t, int64(5), offset)
+
+	err = client.SetCursor(context.Background(), cursorID, stream, partition, 10)
+	require.NoError(t, err)
+
+	offset, err = client.FetchCursor(context.Background(), cursorID, stream, partition)
+	require.NoError(t, err)
+	require.Equal(t, int64(10), offset)
+
+	require.Error(t, client.SetCursor(context.Background(), "", "foo", 0, 5))
+	require.Error(t, client.SetCursor(context.Background(), "123", "", 0, 5))
+
+	_, err = client.FetchCursor(context.Background(), "", "foo", 0)
+	require.Error(t, err)
+	_, err = client.FetchCursor(context.Background(), "123", "", 0)
+	require.Error(t, err)
+}
+
+// publishAndReceive publishes and waits for a message to arrive.
+func publishAndReceive(t *testing.T, client lift.Client, stream string) {
+	gotMsg := make(chan struct{})
+
+	// Subscribe to receive one message.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err := client.Subscribe(context.Background(), stream, func(msg *lift.Message, err error) {
+		require.NoError(t, err)
+		gotMsg <- struct{}{}
+		cancel()
+	})
+	require.NoError(t, err)
+
+	// Publish one message.
+	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err = client.Publish(ctx, stream, []byte{}, lift.AckPolicyLeader())
+	require.NoError(t, err)
+
+	select {
+	case <-gotMsg:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Did not receive expected message")
+	}
+}
+
+// Ensures the message received timestamps returned by FetchPartitionMetadata
+// are updated with coherent values.
+func TestFetchPartitionMetadataMessagesReceivedTimestamps(t *testing.T) {
+	defer cleanupStorage(t)
+
+	// Use a central NATS server.
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	// Configure server.
+	s1Config := getTestConfig("a", true, 5050)
+	s1 := runServerWithConfig(t, s1Config)
+	defer s1.Stop()
+
+	getMetadataLeader(t, 10*time.Second, s1)
+
+	client, err := lift.Connect([]string{"localhost:5050"})
+	require.NoError(t, err)
+	defer client.Close()
+
+	stream := "foo"
+
+	err = client.CreateStream(context.Background(), "foo", stream)
+	require.NoError(t, err)
+
+	metadata, err := client.FetchPartitionMetadata(context.Background(), stream, 0)
+	require.NoError(t, err)
+
+	// Check that the timestamps are zero.
+	require.True(t, metadata.MessagesReceivedTimestamps().FirstTime().IsZero())
+	require.True(t, metadata.MessagesReceivedTimestamps().LatestTime().IsZero())
+
+	// Publish a first message.
+	publishAndReceive(t, client, stream)
+
+	metadata, err = client.FetchPartitionMetadata(context.Background(), stream, 0)
+	require.NoError(t, err)
+
+	// Check that the first messages received timestamp has been updated, and
+	// that the latest timestamp has the same value.
+	firstMessagesReceivedTimestamp := metadata.MessagesReceivedTimestamps().FirstTime()
+	require.False(t, firstMessagesReceivedTimestamp.IsZero())
+	require.Equal(t, firstMessagesReceivedTimestamp, metadata.MessagesReceivedTimestamps().LatestTime())
+
+	// Publish a second message.
+	publishAndReceive(t, client, stream)
+
+	metadata, err = client.FetchPartitionMetadata(context.Background(), stream, 0)
+	require.NoError(t, err)
+
+	// Check that the first messages received timestamp still has the same value
+	// and that the latest timestamp has been updated.
+	require.Equal(t, firstMessagesReceivedTimestamp, metadata.MessagesReceivedTimestamps().FirstTime())
+	require.True(t, metadata.MessagesReceivedTimestamps().LatestTime().After(firstMessagesReceivedTimestamp))
+}
+
+// Ensures the pause timestamps returned by FetchPartitionMetadata are updated
+// with coherent values.
+func TestFetchPartitionMetadataPauseTimestamps(t *testing.T) {
+	defer cleanupStorage(t)
+
+	// Use a central NATS server.
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	// Configure server.
+	s1Config := getTestConfig("a", true, 5050)
+	s1 := runServerWithConfig(t, s1Config)
+	defer s1.Stop()
+
+	getMetadataLeader(t, 10*time.Second, s1)
+
+	client, err := lift.Connect([]string{"localhost:5050"})
+	require.NoError(t, err)
+	defer client.Close()
+
+	stream := "foo"
+
+	err = client.CreateStream(context.Background(), "foo", stream)
+	require.NoError(t, err)
+
+	metadata, err := client.FetchPartitionMetadata(context.Background(), stream, 0)
+	require.NoError(t, err)
+
+	// Check that the timestamps are zero.
+	require.True(t, metadata.PauseTimestamps().FirstTime().IsZero())
+	require.True(t, metadata.PauseTimestamps().LatestTime().IsZero())
+
+	// Pause the stream.
+	err = client.PauseStream(context.Background(), stream)
+	require.NoError(t, err)
+
+	// Check that FetchPartitionMetadata fails on a paused stream.
+	_, err = client.FetchPartitionMetadata(context.Background(), stream, 0)
+	require.Error(t, err)
+
+	// Publish a first message, unpausing the stream.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err = client.Publish(ctx, stream, []byte{}, lift.AckPolicyLeader())
+	require.NoError(t, err)
+
+	metadata, err = client.FetchPartitionMetadata(context.Background(), stream, 0)
+	require.NoError(t, err)
+
+	// Check that the first pause timestamp has been set, and that the latest
+	// timestamp is set after it.
+	firstPauseTimestamp := metadata.PauseTimestamps().FirstTime()
+	require.False(t, firstPauseTimestamp.IsZero())
+	require.True(t, metadata.PauseTimestamps().LatestTime().After(firstPauseTimestamp))
+}
+
+// Ensures the readonly timestamps returned by FetchPartitionMetadata are
+// updated with coherent values.
+func TestFetchPartitionMetadataReadonlyTimestamps(t *testing.T) {
+	defer cleanupStorage(t)
+
+	// Use a central NATS server.
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	// Configure server.
+	s1Config := getTestConfig("a", true, 5050)
+	s1 := runServerWithConfig(t, s1Config)
+	defer s1.Stop()
+
+	getMetadataLeader(t, 10*time.Second, s1)
+
+	client, err := lift.Connect([]string{"localhost:5050"})
+	require.NoError(t, err)
+	defer client.Close()
+
+	stream := "foo"
+
+	err = client.CreateStream(context.Background(), "foo", stream)
+	require.NoError(t, err)
+
+	metadata, err := client.FetchPartitionMetadata(context.Background(), stream, 0)
+	require.NoError(t, err)
+
+	// Check that the timestamps are zero.
+	require.True(t, metadata.ReadonlyTimestamps().FirstTime().IsZero())
+	require.True(t, metadata.ReadonlyTimestamps().LatestTime().IsZero())
+
+	// Set the stream as readonly.
+	err = client.SetStreamReadonly(context.Background(), stream)
+	require.NoError(t, err)
+
+	metadata, err = client.FetchPartitionMetadata(context.Background(), stream, 0)
+	require.NoError(t, err)
+
+	// Check that the first readonly timestamp has been updated, and that the
+	// latest timestamp has the same value.
+	firstReadonlyTimestamp := metadata.ReadonlyTimestamps().FirstTime()
+	require.False(t, firstReadonlyTimestamp.IsZero())
+	require.Equal(t, firstReadonlyTimestamp, metadata.ReadonlyTimestamps().LatestTime())
+
+	// Set the stream as non-readonly.
+	err = client.SetStreamReadonly(context.Background(), stream, lift.Readonly(false))
+	require.NoError(t, err)
+
+	metadata, err = client.FetchPartitionMetadata(context.Background(), stream, 0)
+	require.NoError(t, err)
+
+	// Check that the first readonly timestamp still has the same value and that
+	// the latest timestamp has been updated.
+	require.Equal(t, firstReadonlyTimestamp, metadata.ReadonlyTimestamps().FirstTime())
+	require.True(t, metadata.ReadonlyTimestamps().LatestTime().After(firstReadonlyTimestamp))
 }

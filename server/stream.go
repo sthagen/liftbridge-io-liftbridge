@@ -3,25 +3,32 @@ package server
 import (
 	"fmt"
 	"sync"
+	"time"
+
+	proto "github.com/liftbridge-io/liftbridge/server/protocol"
 )
 
 // stream is a message stream consisting of one or more partitions. Each
 // partition maps to a NATS subject and is the unit of replication.
 type stream struct {
-	name       string
-	subject    string
-	partitions map[int32]*partition
-	resumeAll  bool // When partition(s) are paused, this indicates if all should be resumed
-	mu         sync.RWMutex
+	name         string
+	subject      string
+	config       *proto.StreamConfig
+	partitions   map[int32]*partition
+	resumeAll    bool // When partition(s) are paused, this indicates if all should be resumed
+	creationTime time.Time
+	mu           sync.RWMutex
 }
 
 // newStream creates a stream for the given NATS subject. All stream
 // interactions should only go through the exported functions.
-func newStream(name, subject string) *stream {
+func newStream(name, subject string, config *proto.StreamConfig, creationTime time.Time) *stream {
 	return &stream{
-		name:       name,
-		subject:    subject,
-		partitions: make(map[int32]*partition),
+		name:         name,
+		subject:      subject,
+		config:       config,
+		partitions:   make(map[int32]*partition),
+		creationTime: creationTime,
 	}
 }
 
@@ -45,6 +52,13 @@ func (s *stream) GetSubject() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.subject
+}
+
+// GetConfig returns the stream's custom configuration.
+func (s *stream) GetConfig() *proto.StreamConfig {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.config
 }
 
 // GetResumeAll returns a bool indicating if the stream was paused with
@@ -85,6 +99,13 @@ func (s *stream) SetPartition(id int32, p *partition) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.partitions[id] = p
+}
+
+// GetCreationTime returns the steam's creation time.
+func (s *stream) GetCreationTime() time.Time {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.creationTime
 }
 
 // Close the stream by closing each of its partitions.
@@ -138,5 +159,33 @@ func (s *stream) Delete() error {
 			return err
 		}
 	}
+	return nil
+}
+
+// SetReadonly sets the readonly flag on some or all the partitions of this
+// stream.
+func (s *stream) SetReadonly(partitions []int32, readonly bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	toSetReadonly := make([]*partition, 0, len(partitions))
+	if len(partitions) == 0 {
+		for _, partition := range s.partitions {
+			toSetReadonly = append(toSetReadonly, partition)
+		}
+	} else {
+		for _, partitionID := range partitions {
+			partition, ok := s.partitions[partitionID]
+			if !ok {
+				return ErrPartitionNotFound
+			}
+			toSetReadonly = append(toSetReadonly, partition)
+		}
+	}
+
+	for _, partition := range toSetReadonly {
+		partition.SetReadonly(readonly)
+	}
+
 	return nil
 }

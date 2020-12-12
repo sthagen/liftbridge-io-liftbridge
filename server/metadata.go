@@ -9,7 +9,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/nats-io/nats.go"
 	"github.com/pkg/errors"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -155,6 +154,22 @@ func (m *metadataAPI) FetchMetadata(ctx context.Context, req *client.FetchMetada
 	return resp, nil
 }
 
+// FetchPartitionMetadata retrieves the metadata for the partition leader. This
+// mainly serves the purpose of returning high watermark and newest offset.
+func (m *metadataAPI) FetchPartitionMetadata(ctx context.Context, req *client.FetchPartitionMetadataRequest) (
+	*client.FetchPartitionMetadataResponse, *status.Status) {
+
+	partition := m.GetPartition(req.Stream, req.Partition)
+	if partition == nil {
+		return nil, status.New(codes.NotFound, "partition not found")
+	}
+	if !partition.IsLeader() {
+		return nil, status.New(codes.FailedPrecondition, "The request should be sent to partition leader")
+	}
+	metadata := getPartitionMetadata(req.Partition, partition)
+	return &client.FetchPartitionMetadataResponse{Metadata: metadata}, nil
+}
+
 // brokerCache checks if the cache of broker metadata is clean and, if it is
 // and it's not past the metadata cache max age, returns the cached broker
 // list. The bool returned indicates if the cached data is returned or not.
@@ -185,7 +200,7 @@ func (m *metadataAPI) brokerCache(serverIDs map[string]struct{}) ([]*client.Brok
 // argument is the expected number of peers to get a response from.
 func (m *metadataAPI) fetchBrokerInfo(ctx context.Context, numPeers int) ([]*client.Broker, *status.Status) {
 	// Add ourselves.
-	connectionAddress := m.config.GetConnectionAddress()
+	connectionAddress := m.getConnectionAddress()
 	brokers := []*client.Broker{{
 		Id:   m.config.Clustering.ServerID,
 		Host: connectionAddress.Host,
@@ -193,14 +208,11 @@ func (m *metadataAPI) fetchBrokerInfo(ctx context.Context, numPeers int) ([]*cli
 	}}
 
 	// Make sure there is a deadline on the request.
-	if _, ok := ctx.Deadline(); !ok {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, defaultPropagateTimeout)
-		defer cancel()
-	}
+	ctx, cancel := ensureTimeout(ctx, defaultPropagateTimeout)
+	defer cancel()
 
 	// Create subscription to receive responses on.
-	inbox := nats.NewInbox()
+	inbox := m.getMetadataReplyInbox()
 	sub, err := m.ncRaft.SubscribeSync(inbox)
 	if err != nil {
 		return nil, status.New(codes.Internal, err.Error())
@@ -262,18 +274,13 @@ func (m *metadataAPI) createMetadataResponse(streams []string) *client.FetchMeta
 		} else {
 			partitions := make(map[int32]*client.PartitionMetadata)
 			for id, partition := range stream.GetPartitions() {
-				leader, _ := partition.GetLeader()
-				partitions[id] = &client.PartitionMetadata{
-					Id:       id,
-					Leader:   leader,
-					Replicas: partition.GetReplicas(),
-					Isr:      partition.GetISR(),
-				}
+				partitions[id] = getPartitionMetadata(id, partition)
 			}
 			metadata[i] = &client.StreamMetadata{
-				Name:       name,
-				Subject:    stream.GetSubject(),
-				Partitions: partitions,
+				Name:              name,
+				Subject:           stream.GetSubject(),
+				Partitions:        partitions,
+				CreationTimestamp: stream.GetCreationTime().UnixNano(),
 			}
 		}
 	}
@@ -318,6 +325,8 @@ func (m *metadataAPI) CreateStream(ctx context.Context, req *proto.CreateStreamO
 		partition.Isr = replicas
 		partition.Leader = leader
 	}
+
+	req.Stream.CreationTimestamp = time.Now().UnixNano()
 
 	// Replicate stream create through Raft.
 	op := &proto.RaftLog{
@@ -634,6 +643,45 @@ func (m *metadataAPI) ReportLeader(ctx context.Context, req *proto.ReportLeaderO
 	return reported.addWitness(req.Replica)
 }
 
+// SetStreamReadonly sets a stream's readonly flag if this server is the
+// metadata leader. If it is not, it will forward the request to the leader and
+// return the response. This operation is replicated by Raft. If successful,
+// this will return once the readonly flag has been set.
+func (m *metadataAPI) SetStreamReadonly(ctx context.Context, req *proto.SetStreamReadonlyOp) *status.Status {
+	// Forward the request if we're not the leader.
+	if !m.IsLeader() {
+		isLeader, st := m.propagateSetStreamReadonly(ctx, req)
+		if st != nil {
+			return st
+		}
+		// If we have since become leader, continue on with the request.
+		if !isLeader {
+			return nil
+		}
+	}
+
+	// Replicate stream the readonly flag through Raft.
+	op := &proto.RaftLog{
+		Op:                  proto.Op_SET_STREAM_READONLY,
+		SetStreamReadonlyOp: req,
+	}
+
+	// Wait on result of setting the readonly flag.
+	future, err := m.getRaft().applyOperation(ctx, op, m.checkSetStreamReadonlyPreconditions)
+	if err != nil {
+		code := codes.FailedPrecondition
+		if err == ErrStreamNotFound || err == ErrPartitionNotFound {
+			code = codes.NotFound
+		}
+		return status.Newf(code, err.Error())
+	}
+	if err := future.Error(); err != nil {
+		return status.Newf(codes.Internal, "Failed to set stream readonly flag: %v", err.Error())
+	}
+
+	return nil
+}
+
 // AddStream adds the given stream and its partitions to the metadata store. It
 // returns an error if a stream with the same name or any partitions with the
 // same ID for the stream already exist. If the stream is recovered, this will
@@ -652,19 +700,22 @@ func (m *metadataAPI) AddStream(protoStream *proto.Stream, recovered bool) (*str
 		return nil, ErrStreamExists
 	}
 
-	stream := newStream(protoStream.Name, protoStream.Subject)
+	config := protoStream.GetConfig()
+	creationTime := time.Unix(0, protoStream.CreationTimestamp)
+	stream := newStream(protoStream.Name, protoStream.Subject, config, creationTime)
 	m.streams[protoStream.Name] = stream
 
 	for _, partition := range protoStream.Partitions {
-		if err := m.addPartition(stream, partition, recovered); err != nil {
+		if err := m.addPartition(stream, partition, recovered, config); err != nil {
 			delete(m.streams, protoStream.Name)
 			return nil, err
 		}
 	}
+
 	return stream, nil
 }
 
-func (m *metadataAPI) addPartition(stream *stream, protoPartition *proto.Partition, recovered bool) error {
+func (m *metadataAPI) addPartition(stream *stream, protoPartition *proto.Partition, recovered bool, config *proto.StreamConfig) error {
 	if p := stream.GetPartition(protoPartition.Id); p != nil {
 		// Partition already exists for stream.
 		return fmt.Errorf("partition %d already exists for stream %s",
@@ -672,7 +723,7 @@ func (m *metadataAPI) addPartition(stream *stream, protoPartition *proto.Partiti
 	}
 
 	// This will initialize/recover the durable commit log.
-	partition, err := m.newPartition(protoPartition, recovered)
+	partition, err := m.newPartition(protoPartition, recovered, config)
 	if err != nil {
 		return err
 	}
@@ -713,10 +764,13 @@ func (m *metadataAPI) ResumePartition(streamName string, id int32, recovered boo
 	}
 
 	// Resume the partition by replacing it.
-	partition, err := m.newPartition(partition.Partition, recovered)
+	partition, err := m.replacePartition(partition, recovered, stream.GetConfig())
 	if err != nil {
 		return nil, err
 	}
+	// Update latest pause status change timestamp.
+	partition.pauseTimestamps.update()
+
 	stream.SetPartition(id, partition)
 
 	// Start leader/follower loop if necessary.
@@ -994,6 +1048,18 @@ func (m *metadataAPI) propagateReportLeader(ctx context.Context, req *proto.Repo
 	return m.propagateRequest(ctx, propagate)
 }
 
+// propagateSetStreamReadonly forwards a SetStreamReadonly request to the
+// metadata leader. The bool indicates if this server has since become leader
+// and the request should be performed locally. A Status is returned if the
+// propagated request failed.
+func (m *metadataAPI) propagateSetStreamReadonly(ctx context.Context, req *proto.SetStreamReadonlyOp) (bool, *status.Status) {
+	propagate := &proto.PropagatedRequest{
+		Op:                  proto.Op_SET_STREAM_READONLY,
+		SetStreamReadonlyOp: req,
+	}
+	return m.propagateRequest(ctx, propagate)
+}
+
 // propagateRequest forwards a metadata request to the metadata leader. The
 // bool indicates if this server has since become leader and the request should
 // be performed locally. A Status is returned if the propagated request failed.
@@ -1014,11 +1080,8 @@ func (m *metadataAPI) propagateRequest(ctx context.Context, req *proto.Propagate
 		panic(err)
 	}
 
-	if _, ok := ctx.Deadline(); !ok {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, defaultPropagateTimeout)
-		defer cancel()
-	}
+	ctx, cancel := ensureTimeout(ctx, defaultPropagateTimeout)
+	defer cancel()
 
 	resp, err := m.nc.RequestWithContext(ctx, m.getPropagateInbox(), data)
 	if err != nil {
@@ -1063,11 +1126,14 @@ func (m *metadataAPI) waitForMetadataLeader(ctx context.Context) (bool, error) {
 // waitForPartitionLeader does a best-effort wait for the leader of the given
 // partition to create and start the partition.
 func (m *metadataAPI) waitForPartitionLeader(ctx context.Context, partition *proto.Partition) {
+	ctx, cancel := ensureTimeout(ctx, defaultPropagateTimeout)
+	defer cancel()
+
 	if partition.Leader == m.config.Clustering.ServerID {
 		// If we're the partition leader, there's no need to make a status
 		// request. We can just apply a Raft barrier since the FSM is local.
-		// TODO: Use context deadline
-		if err := m.getRaft().Barrier(5 * time.Second).Error(); err != nil {
+		deadline, _ := ctx.Deadline()
+		if err := m.getRaft().Barrier(time.Until(deadline)).Error(); err != nil {
 			m.logger.Warnf("Failed to apply Raft barrier: %v", err)
 		}
 		return
@@ -1080,6 +1146,7 @@ func (m *metadataAPI) waitForPartitionLeader(ctx context.Context, partition *pro
 	if err != nil {
 		panic(err)
 	}
+
 	inbox := m.getPartitionStatusInbox(partition.Leader)
 	for i := 0; i < 5; i++ {
 		resp, err := m.ncRaft.RequestWithContext(ctx, inbox, req)
@@ -1087,22 +1154,34 @@ func (m *metadataAPI) waitForPartitionLeader(ctx context.Context, partition *pro
 			m.logger.Warnf(
 				"Failed to get status for partition %s from leader %s: %v",
 				partition, partition.Leader, err)
-			time.Sleep(100 * time.Millisecond)
-			continue
+			select {
+			case <-time.After(100 * time.Millisecond):
+				continue
+			case <-ctx.Done():
+				return
+			}
 		}
 		statusResp, err := proto.UnmarshalPartitionStatusResponse(resp.Data)
 		if err != nil {
 			m.logger.Warnf(
 				"Invalid status response for partition %s from leader %s: %v",
 				partition, partition.Leader, err)
-			time.Sleep(100 * time.Millisecond)
-			continue
+			select {
+			case <-time.After(100 * time.Millisecond):
+				continue
+			case <-ctx.Done():
+				return
+			}
 		}
 		if !statusResp.Exists || !statusResp.IsLeader {
 			// The leader hasn't finished creating the partition, so wait a bit
 			// and retry.
-			time.Sleep(100 * time.Millisecond)
-			continue
+			select {
+			case <-time.After(100 * time.Millisecond):
+				continue
+			case <-ctx.Done():
+				return
+			}
 		}
 		break
 	}
@@ -1137,6 +1216,23 @@ func (m *metadataAPI) checkPauseStreamPreconditions(op *proto.RaftLog) error {
 		return ErrStreamNotFound
 	}
 	for _, partitionID := range op.PauseStreamOp.Partitions {
+		if partition := stream.GetPartition(partitionID); partition == nil {
+			return ErrPartitionNotFound
+		}
+	}
+	return nil
+}
+
+// checkSetStreamReadonlyPreconditions checks if the stream and partitions being
+// set readonly exist. If the stream doesn't exist, it returns
+// ErrStreamNotFound. If one or more specified partitions don't exist, it
+// returns ErrPartitionNotFound. Otherwise, it returns nil.
+func (m *metadataAPI) checkSetStreamReadonlyPreconditions(op *proto.RaftLog) error {
+	stream := m.GetStream(op.SetStreamReadonlyOp.Stream)
+	if stream == nil {
+		return ErrStreamNotFound
+	}
+	for _, partitionID := range op.SetStreamReadonlyOp.Partitions {
 		if partition := stream.GetPartition(partitionID); partition == nil {
 			return ErrPartitionNotFound
 		}
@@ -1202,4 +1298,53 @@ func (m *metadataAPI) partitionExists(streamName string, partitionID int32) erro
 // selectRandomReplica selects a random replica from the list of replicas.
 func selectRandomReplica(replicas []string) string {
 	return replicas[rand.Intn(len(replicas))]
+}
+
+// ensureTimeout ensures there is a timeout on the Context. If there is, it
+// returns the Context. If there isn't it returns a new Context wrapping the
+// provided one with the default timeout applied. It also returns a cancel
+// function which must be invoked by the caller in all cases to avoid a Context
+// leak.
+func ensureTimeout(ctx context.Context, defaultTimeout time.Duration) (context.Context, context.CancelFunc) {
+	cancel := func() {}
+	if _, ok := ctx.Deadline(); !ok {
+		ctx, cancel = context.WithTimeout(ctx, defaultTimeout)
+	}
+	return ctx, cancel
+}
+
+// eventTimestampsToProto returns a client proto's partition event timestamps
+// from a partition's event timestamps struct.
+func eventTimestampsToProto(timestamps EventTimestamps) *client.PartitionEventTimestamps {
+	first, latest := timestamps.firstTime, timestamps.latestTime
+	result := &client.PartitionEventTimestamps{}
+
+	// Calling UnixNano() on a zero time is undefined, so we need to make these
+	// checks.
+	if !first.IsZero() {
+		result.FirstTimestamp = first.UnixNano()
+	}
+	if !latest.IsZero() {
+		result.LatestTimestamp = latest.UnixNano()
+	}
+
+	return result
+}
+
+// getPartitionMetadata returns a partition's metadata.
+func getPartitionMetadata(partitionID int32, partition *partition) *client.PartitionMetadata {
+	leader, _ := partition.GetLeader()
+	return &client.PartitionMetadata{
+		Id:                         partitionID,
+		Leader:                     leader,
+		Replicas:                   partition.GetReplicas(),
+		Isr:                        partition.GetISR(),
+		HighWatermark:              partition.log.HighWatermark(),
+		NewestOffset:               partition.log.NewestOffset(),
+		Paused:                     partition.GetPaused(),
+		Readonly:                   partition.GetReadonly(),
+		MessagesReceivedTimestamps: eventTimestampsToProto(partition.MessagesReceivedTimestamps()),
+		PauseTimestamps:            eventTimestampsToProto(partition.PauseTimestamps()),
+		ReadonlyTimestamps:         eventTimestampsToProto(partition.ReadonlyTimestamps()),
+	}
 }

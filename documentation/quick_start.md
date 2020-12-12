@@ -43,12 +43,13 @@ only be set on one server when bootstrapping a cluster.**
 
 ```shell
 $ liftbridge --raft-bootstrap-seed
-INFO[2020-04-27 17:20:21] Liftbridge Version: v1.0.0
-INFO[2020-04-27 17:20:21] Server ID:          agTv5PkzvgKygm688EMd4C
-INFO[2020-04-27 17:20:21] Namespace:          liftbridge-default
-INFO[2020-04-27 17:20:21] Retention Policy:   [Age: 1 week, Compact: false]
-INFO[2020-04-27 17:20:21] Starting server on 0.0.0.0:9292...
-INFO[2020-04-27 17:20:23] Server became metadata leader, performing leader promotion actions
+INFO[2020-10-15 14:29:50] Liftbridge Version:        v1.3.0
+INFO[2020-10-15 14:29:50] Server ID:                 4nbhBr66WnRsy0I5oKF9bo
+INFO[2020-10-15 14:29:50] Namespace:                 liftbridge-default
+INFO[2020-10-15 14:29:50] Default Retention Policy:  [Age: 1 week, Compact: false]
+INFO[2020-10-15 14:29:50] Default Partition Pausing: disabled
+INFO[2020-10-15 14:29:50] Starting server on 0.0.0.0:9292...
+INFO[2020-10-15 14:29:51] Server became metadata leader, performing leader promotion actions
 ```
 
 Once a leader has been elected, other servers will automatically join the cluster.
@@ -56,11 +57,12 @@ We set the `--data-dir` and `--port` flags to avoid clobbering the first server.
 
 ```shell
 $ liftbridge --data-dir /tmp/liftbridge/server-2 --port=9293
-INFO[2020-04-27 17:21:10] Liftbridge Version: v1.0.0
-INFO[2020-04-27 17:21:10] Server ID:          OtKIIhwxBztcSkgZD0xXQP
-INFO[2020-04-27 17:21:10] Namespace:          liftbridge-default
-INFO[2020-04-27 17:21:10] Retention Policy:   [Age: 1 week, Compact: false]
-INFO[2020-04-27 17:21:10] Starting server on 0.0.0.0:9293...
+INFO[2020-10-15 14:30:48] Liftbridge Version:        v1.3.0
+INFO[2020-10-15 14:30:48] Server ID:                 lbW05esZTab3guEwcmWD9M
+INFO[2020-10-15 14:30:48] Namespace:                 liftbridge-default
+INFO[2020-10-15 14:30:48] Default Retention Policy:  [Age: 1 week, Compact: false]
+INFO[2020-10-15 14:30:48] Default Partition Pausing: disabled
+INFO[2020-10-15 14:30:48] Starting server on 0.0.0.0:9293...
 ```
 
 We can also bootstrap a cluster by providing the explicit cluster configuration.

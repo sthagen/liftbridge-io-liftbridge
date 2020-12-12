@@ -24,7 +24,7 @@ USAGE:
    liftbridge [global options] command [command options] [arguments...]
 
 VERSION:
-   v1.0.0
+   v1.3.0
 
 COMMANDS:
    help, h  Shows a list of commands or help for one command
@@ -73,6 +73,7 @@ An example configuration file is shown below.
 ```yaml
 ---
 listen: localhost:9293
+host: localhost
 data.dir: /tmp/liftbridge/server-2
 activity.stream.enabled: true
 
@@ -100,6 +101,21 @@ clustering:
   replica.max.lag.time: 20s
 ```
 
+## Overriding configuration settings with environment variables
+
+For configuration set in the configuration file the value can be overridden
+with environment variables prefixed with `LIFTBRIDGE_`. The key must exist in
+the config file to be overridden.
+
+For example using the config file from above one could override the host and
+logging level with:
+
+```sh
+env LIFTBRIDGE_HOST=liftbridge.example.com \
+  LIFTBRIDGE_LOGGING_LEVEL=error \
+  liftbridge --config config.yaml
+```
+
 ## Configuration Settings
 
 Below is the list of Liftbridge configuration settings, including the name of
@@ -125,10 +141,11 @@ the setting in the configuration file and the CLI flag if it exists.
 | streams | | Write-ahead log configuration for message streams. | map | | [See below](#streams-configuration-settings) |
 | clustering | | Broker cluster configuration. | map | | [See below](#clustering-configuration-settings) |
 | activity | | Meta activity event stream configuration. | map | | [See below](#activity-configuration-settings) |
+| cursors | | Cursor management configuration. | map | | [See below](#cursors-configuration-settings) |
 
 ### NATS Configuration Settings
 
-Below is the list of the configuration settings for the `nats` part of
+Below is the list of the configuration settings for the `nats` section of
 the configuration file.
 
 | Name | Flag | Description | Type | Default | Valid Values |
@@ -136,11 +153,16 @@ the configuration file.
 | servers | nats-servers | List of NATS hosts to connect to. | list | nats://localhost:4222 | |
 | user | | Username to use to connect to NATS servers. | string | | |
 | password | | Password to use to connect to NATS servers. | string | | |
+| tls.cert | | Path to NATS certificate file. | string | | |
+| tls.key | | Path to NATS key file. | string | | |
+| tls.ca  | | Path to NATS CA Root file. | string | | |
 
 ### Streams Configuration Settings
 
-Below is the list of the configuration settings for the `streams` part of the
-configuration file.
+Below is the list of the configuration settings for the `streams` section of the
+configuration file. These settings are applied globally to all streams.
+However, streams can be individually configured when they are created,
+overriding these settings.
 
 | Name | Flag | Description | Type | Default | Valid Values |
 |:----|:----|:----|:----|:----|:----|
@@ -152,10 +174,12 @@ configuration file.
 | segment.max.age | | The maximum time before a new stream log segment is rolled out. A value of 0 means new segments will only be rolled when `segment.max.bytes` is reached. Retention is always done a file at a time, so a larger value means fewer files but less granular control over retention. | duration | value of `retention.max.age` | |
 | compact.enabled | | Enables stream log compaction. Compaction works by retaining only the latest message for each key and discarding older messages. The frequency in which compaction runs is controlled by `cleaner.interval`. | bool | false | |
 | compact.max.goroutines | | The maximum number of concurrent goroutines to use for compaction on a stream log (only applicable if `compact.enabled` is `true`). | int | 10 | |
+| auto.pause.time | | The amount of time a stream partition can go idle, i.e. not receive a message, before it is automatically paused. A value of 0 disables auto pausing. | duration | 0 | |
+| auto.pause.disable.if.subscribers | | Disables automatic stream partition pausing when there are subscribers. | bool | false | |
 
 ### Clustering Configuration Settings
 
-Below is the list of the configuration settings for the `clustering` part of
+Below is the list of the configuration settings for the `clustering` section of
 the configuration file.
 
 | Name | Flag | Description | Type | Default | Valid Values |
@@ -175,7 +199,7 @@ the configuration file.
 
 ### Activity Configuration Settings
 
-Below is the list of the configuration settings for the `activity` part of
+Below is the list of the configuration settings for the `activity` section of
 the configuration file.
 
 | Name | Flag | Description | Type | Default | Valid Values |
@@ -184,3 +208,12 @@ the configuration file.
 | stream.publish.timeout | | The timeout for publishes to the activity stream. This is the time to wait for an ack from the activity stream, which means it's related to `stream.publish.ack.policy`. If the ack policy is `none`, this has no effect.  | duration | 5s | |
 | stream.publish.ack.policy | | The ack policy to use for publishes to the activity stream. The value `none` means publishes will not wait for an ack, `leader` means publishes will wait for the ack sent when the leader has committed the event, and `all` means publishes will wait for the ack sent when all replicas have committed the event. | string | all | [none, leader, all] |
 
+### Cursors Configuration Settings
+
+Below is the list of the configuration settings for the `cursors` section of
+the configuration file.
+
+| Name | Flag | Description | Type | Default | Valid Values |
+|:----|:----|:----|:----|:----|:----|
+| stream.partitions | | Sets the number of partitions for the internal `__cursors` stream which stores consumer cursors. A value of 0 disables the cursors stream. This cannot be changed once it is set. | int | 0 | |
+| stream.auto.pause.time | | The amount of time a partition in the internal `__cursors` stream can go idle, i.e. not receive a cursor update or fetch, before it is automatically paused. A value of 0 disables auto pausing. | duration | 1m | |

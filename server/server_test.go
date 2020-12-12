@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	lift "github.com/liftbridge-io/go-liftbridge"
+	lift "github.com/liftbridge-io/go-liftbridge/v2"
 	natsdTest "github.com/nats-io/nats-server/v2/test"
 	log "github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
@@ -134,6 +134,26 @@ func checkPartitionPaused(t *testing.T, timeout time.Duration, stream string,
 		}
 	}
 	stackFatalf(t, "Expected partition paused %v, got %v", paused, isPaused)
+}
+
+func checkPartitionReadonly(t *testing.T, timeout time.Duration, stream string,
+	partitionID int32, readonly bool, server *Server) {
+
+	partition := server.metadata.GetPartition(stream, partitionID)
+	if partition == nil {
+		stackFatalf(t, "Partition not found")
+	}
+	var (
+		deadline   = time.Now().Add(timeout)
+		isReadonly bool
+	)
+	for time.Now().Before(deadline) {
+		isReadonly = partition.IsReadonly()
+		if isReadonly == readonly {
+			return
+		}
+	}
+	stackFatalf(t, "Expected partition readonly %v, got %v", readonly, isReadonly)
 }
 
 func getPartitionLeader(t *testing.T, timeout time.Duration, name string, partitionID int32, servers ...*Server) *Server {
@@ -471,6 +491,51 @@ func TestBootstrapMisconfiguration(t *testing.T) {
 	}
 }
 
+// Ensure servers with activity stream enabled can be bootstrapped
+// concurrently.
+func TestBootstrapConcurrentWithActivityStream(t *testing.T) {
+	defer cleanupStorage(t)
+
+	// Use a central NATS server.
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	// Start three servers concurrently with activity stream enabled.
+	ids := []string{"s1", "s2", "s3"}
+	type result struct {
+		server *Server
+		err    error
+	}
+	results := make(chan *result, 3)
+	done := make(chan struct{})
+	defer close(done)
+	for _, id := range ids {
+		go func(id string) {
+			config := getTestConfig(id, false, 0)
+			config.Clustering.ServerID = id
+			config.Clustering.RaftBootstrapPeers = ids
+			config.ActivityStream.Enabled = true
+
+			server, err := RunServerWithConfig(config)
+
+			select {
+			case results <- &result{server, err}:
+			case <-done:
+			}
+		}(id)
+	}
+
+	// Wait for the servers to start.
+	for i := 0; i < 3; i++ {
+		res := <-results
+		if res.err != nil {
+			t.Error(res.err)
+		} else {
+			defer res.server.Stop()
+		}
+	}
+}
+
 // Ensure when the metadata leader fails, a new one is elected.
 func TestMetadataLeaderFailover(t *testing.T) {
 	defer cleanupStorage(t)
@@ -697,7 +762,7 @@ func TestStreamRetentionBytes(t *testing.T) {
 	// Configure server.
 	s1Config := getTestConfig("a", true, 5050)
 	s1Config.Streams.SegmentMaxBytes = 1
-	s1Config.Streams.RetentionMaxBytes = 1000
+	s1Config.Streams.RetentionMaxBytes = 100
 	s1Config.BatchMaxMessages = 1
 	s1 := runServerWithConfig(t, s1Config)
 	defer s1.Stop()
@@ -716,7 +781,7 @@ func TestStreamRetentionBytes(t *testing.T) {
 	require.NoError(t, err)
 
 	// Publish some messages.
-	num := 100
+	num := 10
 	for i := 0; i < num; i++ {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -727,7 +792,7 @@ func TestStreamRetentionBytes(t *testing.T) {
 	// Force log clean.
 	forceLogClean(t, subject, name, s1)
 
-	// The first message read back should have offset 87.
+	// The first message read back should have offset 9.
 	msgs := make(chan *lift.Message, 1)
 	ctx, cancel := context.WithCancel(context.Background())
 	err = client.Subscribe(ctx, name, func(msg *lift.Message, err error) {
@@ -740,7 +805,7 @@ func TestStreamRetentionBytes(t *testing.T) {
 	// Wait to get the new message.
 	select {
 	case msg := <-msgs:
-		require.Equal(t, int64(87), msg.Offset())
+		require.Equal(t, int64(9), msg.Offset())
 	case <-time.After(5 * time.Second):
 		t.Fatal("Did not receive expected message")
 	}
@@ -838,7 +903,7 @@ func TestStreamRetentionAge(t *testing.T) {
 	require.NoError(t, err)
 
 	// Publish some messages.
-	num := 100
+	num := 10
 	for i := 0; i < num; i++ {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -850,7 +915,7 @@ func TestStreamRetentionAge(t *testing.T) {
 	forceLogClean(t, subject, name, s1)
 
 	// We expect all segments but the last to be truncated due to age, so the
-	// first message read back should have offset 99.
+	// first message read back should have offset 9.
 	msgs := make(chan *lift.Message, 1)
 	ctx, cancel := context.WithCancel(context.Background())
 	err = client.Subscribe(ctx, name, func(msg *lift.Message, err error) {
@@ -863,7 +928,7 @@ func TestStreamRetentionAge(t *testing.T) {
 	// Wait to get the new message.
 	select {
 	case msg := <-msgs:
-		require.Equal(t, int64(99), msg.Offset())
+		require.Equal(t, int64(9), msg.Offset())
 	case <-time.After(5 * time.Second):
 		t.Fatal("Did not receive expected message")
 	}
@@ -1050,9 +1115,15 @@ func TestSubscribeStartTime(t *testing.T) {
 	defer cleanupStorage(t)
 	timestampBefore := timestamp
 	mockTimestamp := int64(0)
+	timestampCalls := 0
 	timestamp = func() int64 {
 		time := mockTimestamp
-		mockTimestamp += 10
+		// Only increment on every other call because we don't want sendAck to
+		// advance the time as it throws off the subscribe test.
+		if timestampCalls%2 == 0 {
+			mockTimestamp += 10
+		}
+		timestampCalls++
 		return time
 	}
 	defer func() {
@@ -1091,24 +1162,25 @@ func TestSubscribeStartTime(t *testing.T) {
 	}
 
 	// Subscribe with TIMESTAMP 25. This should start reading from offset 3.
-	gotMsg := make(chan struct{})
+	msgCh := make(chan *lift.Message, 1)
 	ctx, cancel := context.WithCancel(context.Background())
 	client.Subscribe(ctx, name, func(msg *lift.Message, err error) {
 		select {
-		case <-gotMsg:
+		case <-msgCh:
 			return
 		default:
 		}
 		require.NoError(t, err)
-		require.Equal(t, int64(3), msg.Offset())
-		require.Equal(t, int64(30), msg.Timestamp().UnixNano())
-		close(gotMsg)
+		msgCh <- msg
+		close(msgCh)
 		cancel()
 	}, lift.StartAtTime(time.Unix(0, 25)))
 
 	// Wait to get the new message.
 	select {
-	case <-gotMsg:
+	case msg := <-msgCh:
+		require.Equal(t, int64(3), msg.Offset())
+		require.Equal(t, int64(30), msg.Timestamp().UnixNano())
 	case <-time.After(5 * time.Second):
 		t.Fatal("Did not receive expected message")
 	}
@@ -1542,6 +1614,244 @@ func TestPauseStreamPropagate(t *testing.T) {
 	checkPartitionPaused(t, 5*time.Second, name, 0, false, s2)
 }
 
+// Test setting and removing the readonly flag on a stream. This test sets all
+// partitions on a stream as readonly and checks that both cannot be published
+// to.
+func TestSetStreamReadonlyAllPartitions(t *testing.T) {
+	defer cleanupStorage(t)
+
+	// Use a central NATS server.
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	// Configure server.
+	s1Config := getTestConfig("a", true, 5050)
+	s1 := runServerWithConfig(t, s1Config)
+	defer s1.Stop()
+
+	// Wait for server to elect itself leader.
+	getMetadataLeader(t, 10*time.Second, s1)
+
+	client, err := lift.Connect([]string{"localhost:5050"})
+	require.NoError(t, err)
+	defer client.Close()
+
+	// Create stream.
+	name := "foo"
+	subject := "foo"
+	err = client.CreateStream(context.Background(), subject, name, lift.Partitions(2))
+	require.NoError(t, err)
+
+	// Set the stream as readonly.
+	err = client.SetStreamReadonly(context.Background(), name)
+	require.NoError(t, err)
+
+	// Check that both partitions are readonly.
+	checkPartitionReadonly(t, 5*time.Second, name, 0, true, s1)
+	checkPartitionReadonly(t, 5*time.Second, name, 1, true, s1)
+
+	// Check that both partitions cannot be published to.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err = client.Publish(ctx, name, []byte("hello"), lift.ToPartition(0))
+	require.Error(t, err)
+
+	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err = client.Publish(ctx, name, []byte("hello"), lift.ToPartition(1))
+	require.Error(t, err)
+}
+
+// Test setting and removing the readonly flag on a partition. A readonly
+// partition should not accept new publications but should still be
+// subscribable. This test sets only one partition as readonly and checks that
+// the other one can still be published to.
+func TestSetStreamReadonlySomePartitions(t *testing.T) {
+	defer cleanupStorage(t)
+
+	// Use a central NATS server.
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	// Configure server.
+	s1Config := getTestConfig("a", true, 5050)
+	s1 := runServerWithConfig(t, s1Config)
+	defer s1.Stop()
+
+	// Wait for server to elect itself leader.
+	getMetadataLeader(t, 10*time.Second, s1)
+
+	client, err := lift.Connect([]string{"localhost:5050"})
+	require.NoError(t, err)
+	defer client.Close()
+
+	// Create stream.
+	name := "foo"
+	subject := "foo"
+	err = client.CreateStream(context.Background(), subject, name, lift.Partitions(2))
+	require.NoError(t, err)
+
+	// Try to set a non-existing stream as readonly.
+	err = client.SetStreamReadonly(context.Background(), "bar")
+	require.Error(t, err)
+
+	// Try to set a non-existing partition as readonly.
+	err = client.SetStreamReadonly(context.Background(), name, lift.ReadonlyPartitions(99))
+	require.Error(t, err)
+
+	// Set one partition as readonly.
+	err = client.SetStreamReadonly(context.Background(), name, lift.ReadonlyPartitions(0))
+	require.NoError(t, err)
+
+	// Make sure setting readonly is idempotent.
+	err = client.SetStreamReadonly(context.Background(), name, lift.ReadonlyPartitions(0))
+	require.NoError(t, err)
+
+	// Check that only the first partition is readonly.
+	checkPartitionReadonly(t, 5*time.Second, name, 0, true, s1)
+	checkPartitionReadonly(t, 5*time.Second, name, 1, false, s1)
+
+	// Publish a message to partition 0.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err = client.Publish(ctx, name, []byte("hello"))
+	require.Error(t, err)
+
+	// Publish a message to partition 1.
+	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err = client.Publish(ctx, name, []byte("hello"), lift.ToPartition(1))
+	require.NoError(t, err)
+
+	msgs := make(chan *lift.Message, 1)
+	ctx, cancel = context.WithCancel(context.Background())
+	err = client.Subscribe(ctx, name, func(msg *lift.Message, err error) {
+		require.NoError(t, err)
+		msgs <- msg
+		cancel()
+	}, lift.StartAtEarliestReceived(), lift.Partition(1))
+	require.NoError(t, err)
+
+	// Wait to get the new message.
+	select {
+	case msg := <-msgs:
+		require.Equal(t, []byte("hello"), msg.Value())
+	case <-time.After(5 * time.Second):
+		t.Fatal("Did not receive expected message")
+	}
+
+	// Check that only the first partition is readonly.
+	checkPartitionReadonly(t, 5*time.Second, name, 0, true, s1)
+	checkPartitionReadonly(t, 5*time.Second, name, 1, false, s1)
+}
+
+// Test subscribing to a readonly stream. Stream messages should be received,
+// followed by an ErrEndOfReadonlyPartition error that also ends the
+// subscription.
+func TestSetStreamReadonlySubscription(t *testing.T) {
+	defer cleanupStorage(t)
+
+	// Use a central NATS server.
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	// Configure server.
+	s1Config := getTestConfig("a", true, 5050)
+	s1 := runServerWithConfig(t, s1Config)
+	defer s1.Stop()
+
+	// Wait for server to elect itself leader.
+	getMetadataLeader(t, 10*time.Second, s1)
+
+	client, err := lift.Connect([]string{"localhost:5050"})
+	require.NoError(t, err)
+	defer client.Close()
+
+	// Create stream.
+	name := "foo"
+	subject := "foo"
+	err = client.CreateStream(context.Background(), subject, name, lift.Partitions(2))
+	require.NoError(t, err)
+
+	// Publish a message to the stream.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err = client.Publish(ctx, name, []byte("hello"))
+	require.NoError(t, err)
+
+	// Set stream as readonly.
+	err = client.SetStreamReadonly(context.Background(), name)
+	require.NoError(t, err)
+
+	msgs := make(chan *lift.Message, 1)
+	ctx, cancel = context.WithCancel(context.Background())
+	err = client.Subscribe(ctx, name, func(msg *lift.Message, err error) {
+		// Ignore published messages, we are only waiting for the end of
+		// readonly partition error.
+		if err == nil {
+			return
+		}
+
+		require.EqualError(t, err, lift.ErrReadonlyPartition.Error())
+		msgs <- msg
+		cancel()
+	}, lift.StartAtEarliestReceived())
+	require.NoError(t, err)
+
+	// Wait to get the error.
+	select {
+	case <-msgs:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Did not receive expected error")
+	}
+}
+
+// Ensure setting a stream readonly works when we send the request to the
+// metadata follower and removing the readonly flag on the stream works when
+// the SetReadonly call is sent to the follower.
+func TestSetStreamReadonlyPropagate(t *testing.T) {
+	defer cleanupStorage(t)
+
+	// Use a central NATS server.
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	// Configure first server.
+	s1Config := getTestConfig("a", true, 0)
+	s1 := runServerWithConfig(t, s1Config)
+	defer s1.Stop()
+
+	// Configure second server.
+	s2Config := getTestConfig("b", false, 5050)
+	s2 := runServerWithConfig(t, s2Config)
+	defer s2.Stop()
+
+	// Connect and send the request to the follower.
+	client, err := lift.Connect([]string{"localhost:5050"})
+	require.NoError(t, err)
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	name := "foo"
+	err = client.CreateStream(ctx, "foo", name)
+	require.NoError(t, err)
+
+	// Set the stream as readonly on follower.
+	err = client.SetStreamReadonly(context.Background(), name)
+	require.NoError(t, err)
+
+	checkPartitionReadonly(t, 5*time.Second, name, 0, true, s1)
+	checkPartitionReadonly(t, 5*time.Second, name, 0, true, s2)
+
+	// Remove the readonly flag from the stream on follower.
+	err = client.SetStreamReadonly(context.Background(), name, lift.Readonly(false))
+	require.NoError(t, err)
+
+	checkPartitionReadonly(t, 5*time.Second, name, 0, false, s1)
+	checkPartitionReadonly(t, 5*time.Second, name, 0, false, s2)
+}
+
 // Ensure publishing to a non-existent stream returns an error.
 func TestPublishNoSuchStream(t *testing.T) {
 	defer cleanupStorage(t)
@@ -1562,7 +1872,9 @@ func TestPublishNoSuchStream(t *testing.T) {
 	require.NoError(t, err)
 	defer client.Close()
 
-	_, err = client.Publish(context.Background(), "foo", []byte("hello"))
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, err = client.Publish(ctx, "foo", []byte("hello"))
 	require.Error(t, err)
 }
 
@@ -1592,6 +1904,8 @@ func TestPublishNoSuchPartition(t *testing.T) {
 	err = client.CreateStream(context.Background(), subject, name)
 	require.NoError(t, err)
 
-	_, err = client.Publish(context.Background(), name, []byte("hello"), lift.ToPartition(42))
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, err = client.Publish(ctx, name, []byte("hello"), lift.ToPartition(42))
 	require.Error(t, err)
 }

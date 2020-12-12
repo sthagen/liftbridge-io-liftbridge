@@ -34,7 +34,7 @@ const (
 // commitLog implements the CommitLog interface, which is a durable write-ahead
 // log.
 type commitLog struct {
-	Options
+	readonly         int32 // Atomic flag
 	deleteCleaner    *deleteCleaner
 	compactCleaner   *compactCleaner
 	name             string
@@ -43,9 +43,10 @@ type commitLog struct {
 	closed           chan struct{}
 	segments         []*segment
 	vActiveSegment   *segment
-	hwWaiters        map[contextReader]chan struct{}
+	hwWaiters        map[contextReader]chan bool
 	leaderEpochCache *leaderEpochCache
 	deleted          bool
+	Options
 }
 
 // Options contains settings for configuring a commitLog.
@@ -115,7 +116,7 @@ func New(opts Options) (CommitLog, error) {
 		compactCleaner:   compactCleaner,
 		hw:               -1,
 		closed:           make(chan struct{}),
-		hwWaiters:        make(map[contextReader]chan struct{}),
+		hwWaiters:        make(map[contextReader]chan bool),
 		leaderEpochCache: epochCache,
 	}
 
@@ -211,8 +212,12 @@ func (l *commitLog) open() error {
 }
 
 // Append writes the given batch of messages to the log and returns their
-// corresponding offsets in the log.
+// corresponding offsets in the log. This will return ErrCommitLogReadonly if
+// the log is in readonly mode.
 func (l *commitLog) Append(msgs []*Message) ([]int64, error) {
+	if l.IsReadonly() {
+		return nil, ErrCommitLogReadonly
+	}
 	if _, err := l.checkAndPerformSplit(); err != nil {
 		return nil, err
 	}
@@ -229,7 +234,9 @@ func (l *commitLog) Append(msgs []*Message) ([]int64, error) {
 }
 
 // AppendMessageSet writes the given message set data to the log and returns
-// the corresponding offsets in the log.
+// the corresponding offsets in the log. This can be called even if the log is
+// in readonly mode to allow for reconciliation, e.g. when replicating from
+// another log.
 func (l *commitLog) AppendMessageSet(ms []byte) ([]int64, error) {
 	if _, err := l.checkAndPerformSplit(); err != nil {
 		return nil, err
@@ -278,9 +285,9 @@ func (l *commitLog) OldestOffset() int64 {
 	return l.segments[0].FirstOffset()
 }
 
-// OffsetForTimestamp returns the earliest offset whose timestamp is greater
-// than or equal to the given timestamp.
-func (l *commitLog) OffsetForTimestamp(timestamp int64) (int64, error) {
+// EarliestOffsetAfterTimestamp returns the earliest offset whose timestamp is
+// greater than or equal to the given timestamp.
+func (l *commitLog) EarliestOffsetAfterTimestamp(timestamp int64) (int64, error) {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 
@@ -321,13 +328,59 @@ func (l *commitLog) OffsetForTimestamp(timestamp int64) (int64, error) {
 	return l.segments[len(l.segments)-1].NextOffset(), nil
 }
 
+// LatestOffsetBeforeTimestamp returns the latest offset whose timestamp is less
+// than or equal to the given timestamp.
+func (l *commitLog) LatestOffsetBeforeTimestamp(timestamp int64) (int64, error) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+
+	// Find the first segment whose base timestamp is greater than the given
+	// timestamp.
+	idx, err := findSegmentIndexByTimestamp(l.segments, timestamp)
+	if err != nil {
+		return 0, errors.Wrap(err, "failed to find log segment for timestamp")
+	}
+	// Search the previous segment for the first entry whose timestamp is
+	// greater than or equal to the given timestamp. If this is the first
+	// segment, just search it.
+	var seg *segment
+	if idx == 0 {
+		seg = l.segments[0]
+		// if the given timestamp is before the start of the stream return an
+		// error.
+		if timestamp < seg.FirstWriteTime() {
+			return 0, errors.New("timestamp is before the beginning of the log")
+		}
+	} else {
+		seg = l.segments[idx-1]
+	}
+
+	// Find entry equal to or greater than the given timestamp.
+	entry, err := seg.findEntryByTimestamp(timestamp)
+	if err == nil {
+		// If it's an exact match, return the offset.
+		if entry.Timestamp == timestamp {
+			return entry.Offset, nil
+		}
+
+		// Otherwise we want the previous offset.
+		return entry.Offset - 1, nil
+	}
+
+	if err != ErrEntryNotFound && err != io.EOF {
+		return 0, errors.Wrap(err, "failed to find log entry for timestamp")
+	}
+
+	return seg.lastOffset, nil
+}
+
 // SetHighWatermark sets the high watermark on the log. All messages up to and
 // including the high watermark are considered committed.
 func (l *commitLog) SetHighWatermark(hw int64) {
 	l.mu.Lock()
 	if hw > l.hw {
 		l.hw = hw
-		l.notifyHWWaiters()
+		l.notifyHWChange()
 	}
 	l.mu.Unlock()
 	// TODO: should we flush the HW to disk here?
@@ -339,24 +392,47 @@ func (l *commitLog) SetHighWatermark(hw int64) {
 func (l *commitLog) OverrideHighWatermark(hw int64) {
 	l.mu.Lock()
 	l.hw = hw
-	l.notifyHWWaiters()
+	l.notifyHWChange()
 	l.mu.Unlock()
 }
 
-func (l *commitLog) notifyHWWaiters() {
+// notifyHWChange signals all HW waiters to wake up because the HW has changed.
+// This must be called within the log mutex.
+func (l *commitLog) notifyHWChange() {
 	for r, ch := range l.hwWaiters {
-		close(ch)
+		ch <- false
 		delete(l.hwWaiters, r)
 	}
 }
 
-func (l *commitLog) waitForHW(r contextReader, hw int64) <-chan struct{} {
-	wait := make(chan struct{})
+// notifyReadonly signals all HW waiters to wake up if the HW is caught up to
+// the LEO because the log has become readonly. This must be called within the
+// log mutex.
+func (l *commitLog) notifyReadonly() {
+	if l.hw < l.NewestOffset() {
+		return
+	}
+	// HW is caught up to LEO so notify HW waiters.
+	for r, ch := range l.hwWaiters {
+		ch <- true
+		delete(l.hwWaiters, r)
+	}
+}
+
+// waitForHW registers an HW waiter and returns a channel which will receive a
+// bool either when the HW changes (false) or the log has become readonly
+// (true).
+func (l *commitLog) waitForHW(r contextReader, hw int64) <-chan bool {
+	wait := make(chan bool, 1)
 	l.mu.Lock()
-	// Check if HW has changed.
 	if l.hw != hw {
-		close(wait)
+		// HW has changed since reader last checked so they can unblock now.
+		wait <- false
+	} else if l.hw == l.NewestOffset() && l.IsReadonly() {
+		// Log is readonly and HW is caught up to LEO so return an error to reader.
+		wait <- true
 	} else {
+		// Reader needs to wait for HW to advance.
 		l.hwWaiters[r] = wait
 	}
 	l.mu.Unlock()
@@ -545,6 +621,32 @@ func (l *commitLog) NotifyLEO(waiter interface{}, leo int64) <-chan struct{} {
 	return l.activeSegment().WaitForLEO(waiter, leo)
 }
 
+// SetReadonly marks the log as readonly. When in readonly mode, new messages
+// cannot be added to the log with Append and committed readers will read up to
+// the log end offset (LEO), if the HW allows so, and then will receive an
+// ErrCommitLogReadonly error. This will unblock committed readers waiting for
+// data if they are at the LEO. Readers will continue to block if the HW is
+// less than the LEO. This does not affect uncommitted readers. Messages can
+// still be written to the log with AppendMessageSet for reconciliation
+// purposes, e.g. when replicating from another log.
+func (l *commitLog) SetReadonly(readonly bool) {
+	value := int32(0)
+	if readonly {
+		value = 1
+	}
+	atomic.StoreInt32(&l.readonly, value)
+	if readonly {
+		l.mu.Lock()
+		l.notifyReadonly()
+		l.mu.Unlock()
+	}
+}
+
+// IsReadonly indicates if the log is in readonly mode.
+func (l *commitLog) IsReadonly() bool {
+	return atomic.LoadInt32(&l.readonly) == 1
+}
+
 // checkAndPerformSplit determines if a new log segment should be rolled out
 // either because the active segment is full or MaxSegmentAge has passed since
 // the first message was written to it. It then performs the split if eligible,
@@ -661,8 +763,11 @@ func (l *commitLog) rebaseSegments(from, to []*segment, epochCache *leaderEpochC
 	to = append(to, from...)
 	// Rebase any leader epoch offsets also. We don't check the error returned
 	// here because Rebase can't return an error since epochCache is not
-	// file-backed.
-	epochCache.Rebase(l.leaderEpochCache, from[0].BaseOffset) // nolint: errcheck
+	// file-backed. The epoch cache is nil if compaction didn't run, in which
+	// case skip this.
+	if epochCache != nil {
+		epochCache.Rebase(l.leaderEpochCache, from[0].BaseOffset) // nolint: errcheck
+	}
 	return to
 }
 

@@ -17,12 +17,13 @@ import (
 	"time"
 
 	"github.com/hashicorp/raft"
+	client "github.com/liftbridge-io/liftbridge-api/go"
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nuid"
 	"github.com/pkg/errors"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 
-	client "github.com/liftbridge-io/liftbridge-api/go"
 	"github.com/liftbridge-io/liftbridge/server/health"
 	"github.com/liftbridge-io/liftbridge/server/logger"
 	proto "github.com/liftbridge-io/liftbridge/server/protocol"
@@ -37,6 +38,7 @@ const (
 	acksConnName        = "acks"
 	publishesConnName   = "publishes"
 	activityStream      = "__activity"
+	cursorsStream       = "__cursors"
 )
 
 // Server is the main Liftbridge object. Create it by calling New or
@@ -52,7 +54,8 @@ type Server struct {
 	ncPublishes        *nats.Conn
 	logger             logger.Logger
 	loggerOut          io.Writer
-	api                *grpc.Server
+	grpcServer         *grpc.Server
+	api                *apiServer
 	metadata           *metadataAPI
 	shutdownCh         chan struct{}
 	raft               atomic.Value
@@ -64,6 +67,7 @@ type Server struct {
 	running            bool
 	goroutineWait      sync.WaitGroup
 	activity           *activityManager
+	cursors            *cursorManager
 }
 
 // RunServerWithConfig creates and starts a new Server with the given
@@ -92,6 +96,7 @@ func New(config *Config) *Server {
 	}
 	s.metadata = newMetadataAPI(s)
 	s.activity = newActivityManager(s)
+	s.cursors = newCursorManager(s)
 	return s
 }
 
@@ -140,10 +145,11 @@ func (s *Server) Start() (err error) {
 	s.listener = l
 	s.port = l.Addr().(*net.TCPAddr).Port
 
-	s.logger.Infof("Liftbridge Version: %s", Version)
-	s.logger.Infof("Server ID:          %s", s.config.Clustering.ServerID)
-	s.logger.Infof("Namespace:          %s", s.config.Clustering.Namespace)
-	s.logger.Infof("Retention Policy:   %s", s.config.Streams.RetentionString())
+	s.logger.Infof("Liftbridge Version:        %s", Version)
+	s.logger.Infof("Server ID:                 %s", s.config.Clustering.ServerID)
+	s.logger.Infof("Namespace:                 %s", s.config.Clustering.Namespace)
+	s.logger.Infof("Default Retention Policy:  %s", s.config.Streams.RetentionString())
+	s.logger.Infof("Default Partition Pausing: %s", s.config.Streams.AutoPauseString())
 	s.logger.Infof("Starting server on %s...",
 		net.JoinHostPort(listenAddress.Host, strconv.Itoa(s.port)))
 
@@ -156,7 +162,7 @@ func (s *Server) Start() (err error) {
 		s.config.Streams.SegmentMaxAge = time.Second
 	}
 
-	if err := s.startMetadataRaft(); err != nil {
+	if err := s.setupMetadataRaft(); err != nil {
 		return errors.Wrap(err, "failed to start Raft node")
 	}
 
@@ -176,7 +182,12 @@ func (s *Server) Start() (err error) {
 
 	s.handleSignals()
 
-	return errors.Wrap(s.startAPIServer(), "failed to start API server")
+	if err := s.startAPIServer(); err != nil {
+		return errors.Wrap(err, "failed to start API server")
+	}
+
+	s.startRaftLeadershipLoop()
+	return nil
 }
 
 // Stop will attempt to gracefully shut the Server down by signaling the stop
@@ -192,8 +203,8 @@ func (s *Server) Stop() error {
 	s.logger.Info("Shutting down...")
 
 	close(s.shutdownCh)
-	if s.api != nil {
-		s.api.Stop()
+	if s.grpcServer != nil {
+		s.grpcServer.Stop()
 	}
 
 	if s.listener != nil {
@@ -209,13 +220,6 @@ func (s *Server) Stop() error {
 
 	if raft := s.getRaft(); raft != nil {
 		if err := raft.shutdown(); err != nil {
-			s.mu.Unlock()
-			return err
-		}
-	}
-
-	if s.activity != nil {
-		if err := s.activity.Close(); err != nil {
 			s.mu.Unlock()
 			return err
 		}
@@ -246,6 +250,30 @@ func (s *Server) IsRunning() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.running
+}
+
+// GetListenPort returns the port the server is listening to. Returns 0 if the
+// server is not listening.
+func (s *Server) GetListenPort() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.port
+}
+
+// getConnectionAddress returns the connection address that should be used by
+// the server. It uses the port the server is currently listening to if the
+// connection port is 0, so that an OS-assigned port can be used as a connection
+// port.
+func (s *Server) getConnectionAddress() HostPort {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	address := s.config.GetConnectionAddress()
+	if address.Port == 0 {
+		address.Port = s.port
+	}
+
+	return address
 }
 
 // recoverAndPersistState recovers any existing server metadata state from disk
@@ -373,18 +401,19 @@ func (s *Server) startAPIServer() error {
 		opts = append(opts, grpc.Creds(creds))
 	}
 
-	api := grpc.NewServer(opts...)
-	s.api = api
-	client.RegisterAPIServer(api, &apiServer{s})
+	grpcServer := grpc.NewServer(opts...)
+	s.grpcServer = grpcServer
+	s.api = &apiServer{s}
+	client.RegisterAPIServer(grpcServer, s.api)
 
-	health.Register(api)
+	health.Register(grpcServer)
 
 	s.mu.Lock()
 	s.running = true
 	s.mu.Unlock()
 	s.startGoroutine(func() {
 		health.SetServing()
-		err := api.Serve(s.listener)
+		err := grpcServer.Serve(s.listener)
 		s.mu.Lock()
 		s.running = false
 		s.mu.Unlock()
@@ -435,16 +464,10 @@ func (s *Server) createNATSConn(name string) (*nats.Conn, error) {
 	return opts.Connect()
 }
 
-// startMetadataRaft creates and starts an embedded Raft node to participate in
-// the metadata cluster. This will bootstrap using the configured server
-// settings and start a goroutine for automatically responding to Raft
-// leadership changes.
-func (s *Server) startMetadataRaft() error {
-	if err := s.setupMetadataRaft(); err != nil {
-		return err
-	}
+// startRaftLeadershipLoop start a goroutine for automatically responding to
+// Raft leadership changes.
+func (s *Server) startRaftLeadershipLoop() {
 	node := s.getRaft()
-
 	s.startGoroutine(func() {
 		for {
 			select {
@@ -478,7 +501,6 @@ func (s *Server) startMetadataRaft() error {
 			}
 		}
 	})
-	return nil
 }
 
 // setRaft sets the Raft node for the server. This should only be called once
@@ -513,6 +535,10 @@ func (s *Server) leadershipAcquired() error {
 	s.leaderSub = sub
 
 	if err := s.activity.BecomeLeader(); err != nil {
+		return err
+	}
+
+	if err := s.cursors.Initialize(); err != nil {
 		return err
 	}
 
@@ -578,6 +604,8 @@ func (s *Server) handlePropagatedRequest(m *nats.Msg) {
 		resp = s.handlePauseStream(req)
 	case proto.Op_RESUME_STREAM:
 		resp = s.handleResumeStream(req)
+	case proto.Op_SET_STREAM_READONLY:
+		resp = s.handleSetStreamReadonly(req)
 	default:
 		s.logger.Warnf("Unknown propagated request operation: %s", req.Op)
 		return
@@ -661,6 +689,16 @@ func (s *Server) handleResumeStream(req *proto.PropagatedRequest) *proto.Propaga
 	return resp
 }
 
+func (s *Server) handleSetStreamReadonly(req *proto.PropagatedRequest) *proto.PropagatedResponse {
+	resp := &proto.PropagatedResponse{
+		Op: req.Op,
+	}
+	if err := s.metadata.SetStreamReadonly(context.Background(), req.SetStreamReadonlyOp); err != nil {
+		resp.Error = &proto.Error{Code: uint32(err.Code()), Msg: err.Message()}
+	}
+	return resp
+}
+
 func (s *Server) isShutdown() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -705,8 +743,19 @@ func (s *Server) natsClosedHandler(nc *nats.Conn) {
 // natsErrorHandler fires when there is an asynchronous error on the NATS
 // connection.
 func (s *Server) natsErrorHandler(nc *nats.Conn, sub *nats.Subscription, err error) {
-	s.logger.Errorf("Asynchronous error on connection %s, subject %s: %s",
-		nc.Opts.Name, sub.Subject, err)
+	var (
+		msg    = "Asynchronous error on NATS connection"
+		prefix = " "
+	)
+	if nc != nil {
+		msg += fmt.Sprintf(" %s", nc.Opts.Name)
+		prefix = ", "
+	}
+	if sub != nil {
+		msg += fmt.Sprintf("%ssubject %s", prefix, sub.Subject)
+	}
+	msg += fmt.Sprintf(": %s", err)
+	s.logger.Errorf(msg)
 }
 
 // handleServerInfoRequest is a NATS handler used to process requests for
@@ -723,7 +772,7 @@ func (s *Server) handleServerInfoRequest(m *nats.Msg) {
 		return
 	}
 
-	connectionAddress := s.config.GetConnectionAddress()
+	connectionAddress := s.getConnectionAddress()
 	data, err := proto.MarshalServerInfoResponse(&proto.ServerInfoResponse{
 		Id:   s.config.Clustering.ServerID,
 		Host: connectionAddress.Host,
@@ -805,6 +854,12 @@ func (s *Server) getPartitionStatusInbox(id string) string {
 	return fmt.Sprintf("%s.status.%s", s.baseMetadataRaftSubject(), id)
 }
 
+// getMetadataReplyInbox returns a random NATS subject to use for metadata
+// responses scoped to the cluster namespace.
+func (s *Server) getMetadataReplyInbox() string {
+	return fmt.Sprintf("%s.fetch.%s", s.baseMetadataRaftSubject(), nuid.Next())
+}
+
 // getPartitionNotificationInbox returns the NATS subject used for leaders to
 // indicate new data is available on a partition for a follower to replicate if
 // the follower is idle.
@@ -812,10 +867,22 @@ func (s *Server) getPartitionNotificationInbox(id string) string {
 	return fmt.Sprintf("%s.notify.%s", s.config.Clustering.Namespace, id)
 }
 
+// getAckInbox returns a random NATS subject to use for publish acks scoped to
+// the cluster namespace.
+func (s *Server) getAckInbox() string {
+	return fmt.Sprintf("%s.ack.%s", s.config.Clustering.Namespace, nuid.Next())
+}
+
 // getActivityStreamSubject returns the NATS subject used for publishing
 // activity stream events.
 func (s *Server) getActivityStreamSubject() string {
 	return fmt.Sprintf("%s.activity", s.config.Clustering.Namespace)
+}
+
+// getCursorStreamSubject returns the NATS subject used for storing consumer
+// partition cursors.
+func (s *Server) getCursorStreamSubject() string {
+	return fmt.Sprintf("%s.cursors", s.config.Clustering.Namespace)
 }
 
 // startGoroutine starts a goroutine which is managed by the server. This adds

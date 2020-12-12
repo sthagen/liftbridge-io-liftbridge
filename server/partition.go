@@ -52,6 +52,23 @@ func (r *replica) getLatestOffset() int64 {
 	return r.offset
 }
 
+// EventTimestamps contains the first and latest times when an event has
+// occurred.
+type EventTimestamps struct {
+	firstTime  time.Time // Time when the first event occurred.
+	latestTime time.Time // Time when the latest event occurred.
+}
+
+// update should be called when an event has occurred. It updates the first and
+// latest timestamps.
+func (e *EventTimestamps) update() {
+	timestamp := time.Now()
+	if e.firstTime.IsZero() {
+		e.firstTime = timestamp
+	}
+	e.latestTime = timestamp
+}
+
 // partition represents a replicated message stream partition backed by a
 // durable commit log. A partition is attached to a NATS subject and stores
 // messages on that subject in a file-backed log. A partition has a set of
@@ -62,30 +79,37 @@ func (r *replica) getLatestOffset() int64 {
 // leader's log by fetching messages from it. All partition access should go
 // through exported methods.
 type partition struct {
+	mu                            sync.RWMutex
+	closeMu                       sync.Mutex
+	sub                           *nats.Subscription // Subscription to partition NATS subject
+	leaderReplSub                 *nats.Subscription // Subscription for replication requests from followers
+	leaderOffsetSub               *nats.Subscription // Subscription for leader epoch offset requests from followers
+	log                           commitlog.CommitLog
+	srv                           *Server
+	isLeading                     bool
+	isFollowing                   bool
+	isClosed                      bool
+	replicas                      map[string]struct{}
+	isr                           map[string]*replica
+	minISR                        int
+	replicators                   map[string]*replicator
+	commitQueue                   *queue.Queue
+	commitCheck                   chan struct{}
+	recovered                     bool
+	stopFollower                  chan struct{}
+	stopLeader                    chan struct{}
+	notify                        chan struct{}
+	belowMinISR                   bool
+	pause                         bool // Pause replication on the leader (for unit testing)
+	shutdown                      sync.WaitGroup
+	paused                        bool
+	autoPauseTime                 time.Duration
+	autoPauseDisableIfSubscribers bool
+	subscriberCount               int64
+	messagesReceivedTimestamps    EventTimestamps // First and latest time a message was received on this partition
+	pauseTimestamps               EventTimestamps // First and latest time this partition was paused or resumed
+	readonlyTimestamps            EventTimestamps // First and latest time this partition had its read-only status changed
 	*proto.Partition
-	mu              sync.RWMutex
-	sub             *nats.Subscription // Subscription to partition NATS subject
-	leaderReplSub   *nats.Subscription // Subscription for replication requests from followers
-	leaderOffsetSub *nats.Subscription // Subscription for leader epoch offset requests from followers
-	recvChan        chan *nats.Msg     // Channel leader places received messages on
-	log             commitlog.CommitLog
-	srv             *Server
-	isLeading       bool
-	isFollowing     bool
-	isClosed        bool
-	replicas        map[string]struct{}
-	isr             map[string]*replica
-	replicators     map[string]*replicator
-	commitQueue     *queue.Queue
-	commitCheck     chan struct{}
-	recovered       bool
-	stopFollower    chan struct{}
-	stopLeader      chan struct{}
-	notify          chan struct{}
-	belowMinISR     bool
-	pause           bool // Pause replication on the leader (for unit testing)
-	shutdown        sync.WaitGroup
-	paused          bool
 }
 
 // newPartition creates a new stream partition. If the partition is recovered,
@@ -95,23 +119,38 @@ type partition struct {
 //
 // A partitioned stream maps to separate NATS subjects: subject, subject.1,
 // subject.2, etc.
-func (s *Server) newPartition(protoPartition *proto.Partition, recovered bool) (*partition, error) {
+func (s *Server) newPartition(protoPartition *proto.Partition, recovered bool, config *proto.StreamConfig) (*partition, error) {
+	streamsConfig := &StreamsConfig{
+		SegmentMaxBytes:               s.config.Streams.SegmentMaxBytes,
+		SegmentMaxAge:                 s.config.Streams.SegmentMaxAge,
+		RetentionMaxBytes:             s.config.Streams.RetentionMaxBytes,
+		RetentionMaxMessages:          s.config.Streams.RetentionMaxMessages,
+		RetentionMaxAge:               s.config.Streams.RetentionMaxAge,
+		CleanerInterval:               s.config.Streams.CleanerInterval,
+		Compact:                       s.config.Streams.Compact,
+		CompactMaxGoroutines:          s.config.Streams.CompactMaxGoroutines,
+		AutoPauseTime:                 s.config.Streams.AutoPauseTime,
+		AutoPauseDisableIfSubscribers: s.config.Streams.AutoPauseDisableIfSubscribers,
+		MinISR:                        s.config.Clustering.MinISR,
+	}
+	streamsConfig.ApplyOverrides(config)
 	var (
 		file = filepath.Join(s.config.DataDir, "streams", protoPartition.Stream,
 			strconv.FormatInt(int64(protoPartition.Id), 10))
 		name = fmt.Sprintf("[subject=%s, stream=%s, partition=%d]",
 			protoPartition.Subject, protoPartition.Stream, protoPartition.Id)
+
 		log, err = commitlog.New(commitlog.Options{
 			Name:                 name,
 			Path:                 file,
-			MaxSegmentBytes:      s.config.Streams.SegmentMaxBytes,
-			MaxSegmentAge:        s.config.Streams.SegmentMaxAge,
-			MaxLogBytes:          s.config.Streams.RetentionMaxBytes,
-			MaxLogMessages:       s.config.Streams.RetentionMaxMessages,
-			MaxLogAge:            s.config.Streams.RetentionMaxAge,
-			CleanerInterval:      s.config.Streams.CleanerInterval,
-			Compact:              s.config.Streams.Compact,
-			CompactMaxGoroutines: s.config.Streams.CompactMaxGoroutines,
+			MaxSegmentBytes:      streamsConfig.SegmentMaxBytes,
+			MaxSegmentAge:        streamsConfig.SegmentMaxAge,
+			MaxLogBytes:          streamsConfig.RetentionMaxBytes,
+			MaxLogMessages:       streamsConfig.RetentionMaxMessages,
+			MaxLogAge:            streamsConfig.RetentionMaxAge,
+			CleanerInterval:      streamsConfig.CleanerInterval,
+			Compact:              streamsConfig.Compact,
+			CompactMaxGoroutines: streamsConfig.CompactMaxGoroutines,
 			Logger:               s.logger,
 		})
 	)
@@ -135,17 +174,34 @@ func (s *Server) newPartition(protoPartition *proto.Partition, recovered bool) (
 	}
 
 	st := &partition{
-		Partition:   protoPartition,
-		log:         log,
-		srv:         s,
-		replicas:    replicas,
-		isr:         isr,
-		commitCheck: make(chan struct{}, len(protoPartition.Replicas)),
-		notify:      make(chan struct{}, 1),
-		recovered:   recovered,
+		Partition:                     protoPartition,
+		log:                           log,
+		srv:                           s,
+		replicas:                      replicas,
+		isr:                           isr,
+		minISR:                        streamsConfig.MinISR,
+		commitCheck:                   make(chan struct{}, len(protoPartition.Replicas)),
+		notify:                        make(chan struct{}, 1),
+		recovered:                     recovered,
+		autoPauseTime:                 streamsConfig.AutoPauseTime,
+		autoPauseDisableIfSubscribers: streamsConfig.AutoPauseDisableIfSubscribers,
 	}
 
 	return st, nil
+}
+
+// replacePartition creates a new stream partition to replace another one. The
+// old partition's events timestamps are kept.
+func (s *Server) replacePartition(oldPartition *partition, recovered bool, config *proto.StreamConfig) (*partition, error) {
+	st, err := s.newPartition(oldPartition.Partition, recovered, config)
+
+	if err == nil {
+		st.messagesReceivedTimestamps = oldPartition.MessagesReceivedTimestamps()
+		st.pauseTimestamps = oldPartition.PauseTimestamps()
+		st.readonlyTimestamps = oldPartition.ReadonlyTimestamps()
+	}
+
+	return st, err
 }
 
 // String returns a human-readable string representation of the partition.
@@ -153,7 +209,12 @@ func (p *partition) String() string {
 	return fmt.Sprintf("[subject=%s, stream=%s, partition=%d]", p.Subject, p.Stream, p.Id)
 }
 
+// close stops the partition if it is running and closes the commit log. Must
+// be called within the scope of the partition mutex.
 func (p *partition) close() error {
+	p.closeMu.Lock()
+	defer p.closeMu.Unlock()
+
 	if p.isClosed {
 		return nil
 	}
@@ -185,6 +246,8 @@ func (p *partition) Pause() error {
 	defer p.mu.Unlock()
 
 	p.paused = true
+	p.Paused = true // Also set the protobuf value (used for snapshotting)
+	p.pauseTimestamps.update()
 
 	return p.close()
 }
@@ -194,6 +257,24 @@ func (p *partition) IsPaused() bool {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return p.paused
+}
+
+// SetReadonly enables or disables readonly for the partition. When enabled,
+// new messages cannot be written to the log and consumers will not block once
+// they reach the end of the log. This does not affect replication.
+func (p *partition) SetReadonly(readonly bool) {
+	p.log.SetReadonly(readonly)
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.Readonly = readonly // Also set the protobuf value (used for snapshotting)
+	p.readonlyTimestamps.update()
+}
+
+// IsReadonly indicates if the partition is currently readonly.
+func (p *partition) IsReadonly() bool {
+	return p.log.IsReadonly()
 }
 
 // Delete stops the partition if it is running, closes, and deletes the commit
@@ -207,6 +288,57 @@ func (p *partition) Delete() error {
 	}
 
 	return p.stopLeadingOrFollowing()
+}
+
+// IncreaseSubscriberCount increases the number of subscribers. Partitions with
+// a subscriber count greater than zero will not be auto-paused if the partition
+// is idle, and the corresponding configuration option is set.
+func (p *partition) IncreaseSubscriberCount() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.subscriberCount++
+}
+
+// DecreaseSubscriberCount decreases the number of subscribers. Partitions with
+// a subscriber count greater than zero will not be auto-paused if the partition
+// is idle, and the corresponding configuration option is set.
+func (p *partition) DecreaseSubscriberCount() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.subscriberCount--
+	if p.subscriberCount < 0 {
+		p.subscriberCount = 0
+		p.srv.logger.Errorf("Negative partition subscriber count for partition %s: %d", p, p.subscriberCount)
+	}
+}
+
+// MessagesReceivedTimestamps returns the first and latest times a message was
+// received on this partition.
+func (p *partition) MessagesReceivedTimestamps() EventTimestamps {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	return p.messagesReceivedTimestamps
+}
+
+// PauseTimestamps returns the first and latest time this partition was paused
+// or resumed.
+func (p *partition) PauseTimestamps() EventTimestamps {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	return p.pauseTimestamps
+}
+
+// ReadonlyTimestamps returns the first and latest time this partition had its
+// read-only status changed.
+func (p *partition) ReadonlyTimestamps() EventTimestamps {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	return p.readonlyTimestamps
 }
 
 // Notify is used to short circuit the sleep backoff a partition uses when it
@@ -294,7 +426,7 @@ func (p *partition) startLeadingOrFollowing() error {
 }
 
 // stopLeadingOrFollowing stops the partition as a leader or follower, if
-// applicable.
+// applicable. Must be called within the scope of the partition mutex.
 func (p *partition) stopLeadingOrFollowing() error {
 	if p.isFollowing {
 		// Stop following if previously a follower.
@@ -342,10 +474,10 @@ func (p *partition) becomeLeader(epoch uint64) error {
 	}
 
 	// Start message processing loop.
-	p.recvChan = make(chan *nats.Msg, recvChannelSize)
+	recvChan := make(chan *nats.Msg, recvChannelSize)
 	p.stopLeader = make(chan struct{})
 	p.srv.startGoroutine(func() {
-		p.messageProcessingLoop(p.recvChan, p.stopLeader, epoch)
+		p.messageProcessingLoop(recvChan, p.stopLeader, epoch)
 		p.shutdown.Done()
 	})
 
@@ -355,7 +487,7 @@ func (p *partition) becomeLeader(epoch uint64) error {
 	// Subscribe to the NATS subject and begin sequencing messages.
 	// TODO: This should be drained on shutdown.
 	sub, err := p.srv.nc.QueueSubscribe(p.getSubject(), p.Group, func(m *nats.Msg) {
-		p.recvChan <- m
+		recvChan <- m
 	})
 	if err != nil {
 		return errors.Wrap(err, "failed to subscribe to NATS")
@@ -381,6 +513,13 @@ func (p *partition) becomeLeader(epoch uint64) error {
 	p.leaderOffsetSub = sub
 	p.srv.ncRepl.Flush()
 
+	// Start auto-pause timer if enabled.
+	if p.autoPauseTime > 0 {
+		p.srv.startGoroutine(func() {
+			p.autoPauseLoop(p.stopLeader)
+		})
+	}
+
 	p.isLeading = true
 	p.isFollowing = false
 
@@ -389,7 +528,8 @@ func (p *partition) becomeLeader(epoch uint64) error {
 
 // stopLeading causes the partition to step down as leader by unsubscribing
 // from the NATS subject and replication subject, stopping message processing
-// and replication, and disposing the commit queue.
+// and replication, and disposing the commit queue. Must be called within the
+// scope of the partition mutex.
 func (p *partition) stopLeading() error {
 	// Unsubscribe from NATS subject.
 	if err := p.sub.Unsubscribe(); err != nil {
@@ -414,12 +554,14 @@ func (p *partition) stopLeading() error {
 	}
 	close(p.stopLeader)
 
-	// Wait for loops to shutdown.
+	// Wait for loops to shutdown. Release mutex while we wait to avoid
+	// deadlocks.
+	p.mu.Unlock()
 	p.shutdown.Wait()
+	p.mu.Lock()
 
 	p.commitQueue.Dispose()
 	p.isLeading = false
-	p.recvChan = nil // Nil this out since it's a non-trivial amount of memory
 
 	return nil
 }
@@ -579,6 +721,47 @@ func (p *partition) getLeaderOffsetRequestInbox() string {
 		p.srv.config.Clustering.Namespace, p.Stream, p.Id)
 }
 
+// autoPauseLoop is a long-running loop the leader runs to check if the
+// partition should be automatically paused due to inactivity.
+func (p *partition) autoPauseLoop(stop <-chan struct{}) {
+	timer := time.NewTimer(p.autoPauseTime)
+	defer timer.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-timer.C:
+		}
+
+		p.mu.RLock()
+		latestReceivedElapsed := time.Since(p.messagesReceivedTimestamps.latestTime)
+		subsAllowPausing := !p.autoPauseDisableIfSubscribers || p.subscriberCount == 0
+		p.mu.RUnlock()
+
+		if latestReceivedElapsed > p.autoPauseTime && subsAllowPausing {
+			p.srv.logger.Infof("Partition %s has not received a message in over %s, "+
+				"auto pausing partition", p, p.autoPauseTime)
+			if err := p.requestPause(); err != nil {
+				p.srv.logger.Errorf("Failed to auto pause partition %s: %v", p, err)
+			}
+		}
+
+		timer.Reset(computeTick(latestReceivedElapsed, p.autoPauseTime))
+	}
+}
+
+// requestPause sends a request to pause the partition.
+func (p *partition) requestPause() error {
+	if e := p.srv.metadata.PauseStream(context.Background(), &proto.PauseStreamOp{
+		Stream:     p.Stream,
+		Partitions: []int32{p.Id},
+		ResumeAll:  false,
+	}); e != nil {
+		return e.Err()
+	}
+	return nil
+}
+
 // messageProcessingLoop is a long-running loop that processes messages
 // received on the given channel until the stop channel is closed. This will
 // attempt to batch messages up before writing them to the commit log. Once
@@ -602,6 +785,10 @@ func (p *partition) messageProcessingLoop(recvChan <-chan *nats.Msg, stop <-chan
 			return
 		case msg = <-recvChan:
 		}
+
+		p.mu.Lock()
+		p.messagesReceivedTimestamps.update()
+		p.mu.Unlock()
 
 		m := natsToProtoMessage(msg, leaderEpoch)
 		msgBatch = append(msgBatch, m)
@@ -639,7 +826,7 @@ func (p *partition) messageProcessingLoop(recvChan <-chan *nats.Msg, stop <-chan
 		offsets, err := p.log.Append(msgBatch)
 		if err != nil {
 			p.srv.logger.Errorf("Failed to append to log %s: %v", p, err)
-			return
+			continue
 		}
 
 		for i, msg := range msgBatch {
@@ -659,13 +846,14 @@ func (p *partition) messageProcessingLoop(recvChan <-chan *nats.Msg, stop <-chan
 // queue and committed when the entire ISR has replicated them.
 func (p *partition) processPendingMessage(offset int64, msg *commitlog.Message) {
 	ack := &client.Ack{
-		Stream:           p.Stream,
-		PartitionSubject: p.Subject,
-		MsgSubject:       string(msg.Headers["subject"]),
-		Offset:           offset,
-		AckInbox:         msg.AckInbox,
-		CorrelationId:    msg.CorrelationID,
-		AckPolicy:        msg.AckPolicy,
+		Stream:             p.Stream,
+		PartitionSubject:   p.Subject,
+		MsgSubject:         string(msg.Headers["subject"]),
+		Offset:             offset,
+		AckInbox:           msg.AckInbox,
+		CorrelationId:      msg.CorrelationID,
+		AckPolicy:          msg.AckPolicy,
+		ReceptionTimestamp: msg.Timestamp,
 	}
 	if msg.AckPolicy == client.AckPolicy_LEADER {
 		// Send the ack now since AckPolicy_LEADER means we ack as soon as the
@@ -720,15 +908,12 @@ func (p *partition) commitLoop(stop chan struct{}) {
 
 		// Check if the ISR size is below the minimum ISR size. If it is, we
 		// cannot commit any messages.
-		var (
-			minISR  = p.srv.config.Clustering.MinISR
-			isrSize = len(p.isr)
-		)
-		if isrSize < minISR {
+		isrSize := len(p.isr)
+		if isrSize < p.minISR {
 			p.mu.RUnlock()
 			p.srv.logger.Errorf(
 				"Unable to commit messages for partition %s, ISR size (%d) below minimum (%d)",
-				p, isrSize, minISR)
+				p, isrSize, p.minISR)
 			continue
 		}
 
@@ -780,6 +965,7 @@ func (p *partition) sendAck(ack *client.Ack) {
 	if ack.AckInbox == "" {
 		return
 	}
+	ack.CommitTimestamp = timestamp()
 	data, err := proto.MarshalAck(ack)
 	if err != nil {
 		panic(err)
@@ -803,6 +989,14 @@ func (p *partition) replicationRequestLoop(leader string, epoch uint64, stop <-c
 		if err != nil {
 			p.srv.logger.Errorf(
 				"Error sending replication request for partition %s: %v", p, err)
+
+			// Check if the loop has since been stopped. This is possible, for
+			// example, if another leader was since elected.
+			select {
+			case <-stop:
+				return
+			default:
+			}
 		} else {
 			leaderLastSeen = time.Now()
 		}
@@ -987,15 +1181,18 @@ func (p *partition) RemoveFromISR(replica string) error {
 	}
 	delete(p.isr, replica)
 
+	// Also update the ISR on the protobuf so this state is persisted.
+	p.Isr = make([]string, 0, len(p.isr))
+	for replica := range p.isr {
+		p.Isr = append(p.Isr, replica)
+	}
+
 	// Check if ISR went below minimum ISR size. This is important for
 	// operators to be aware of.
-	var (
-		minISR  = p.srv.config.Clustering.MinISR
-		isrSize = len(p.isr)
-	)
-	if !p.belowMinISR && isrSize < minISR {
+	isrSize := len(p.isr)
+	if !p.belowMinISR && isrSize < p.minISR {
 		p.srv.logger.Errorf("ISR for partition %s has shrunk below minimum size %d, currently %d",
-			p, minISR, isrSize)
+			p, p.minISR, isrSize)
 		p.belowMinISR = true
 	}
 
@@ -1020,14 +1217,17 @@ func (p *partition) AddToISR(rep string) error {
 	}
 	p.isr[rep] = &replica{offset: -1}
 
+	// Also update the ISR on the protobuf so this state is persisted.
+	p.Isr = make([]string, 0, len(p.isr))
+	for replica := range p.isr {
+		p.Isr = append(p.Isr, replica)
+	}
+
 	// Check if ISR recovered from being below the minimum ISR size.
-	var (
-		minISR  = p.srv.config.Clustering.MinISR
-		isrSize = len(p.isr)
-	)
-	if p.belowMinISR && isrSize >= minISR {
+	isrSize := len(p.isr)
+	if p.belowMinISR && isrSize >= p.minISR {
 		p.srv.logger.Infof("ISR for partition %s has recovered from being below minimum size %d, currently %d",
-			p, minISR, isrSize)
+			p, p.minISR, isrSize)
 		p.belowMinISR = false
 	}
 
@@ -1179,6 +1379,17 @@ func natsToProtoMessage(msg *nats.Msg, leaderEpoch uint64) *commitlog.Message {
 	m.Headers["subject"] = []byte(msg.Subject)
 	m.Headers["reply"] = []byte(msg.Reply)
 	return m
+}
+
+// computeTick calculates a generic amount of time a loop should sleep before
+// performing an action. This is adjusted based on how much time has elapsed
+// since an arbitrary event.
+func computeTick(timeElapsed, maxSleep time.Duration) time.Duration {
+	tick := maxSleep - timeElapsed
+	if tick < 0 {
+		tick = maxSleep
+	}
+	return tick
 }
 
 // min returns the minimum int64 contained in the slice.

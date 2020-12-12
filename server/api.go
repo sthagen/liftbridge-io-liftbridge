@@ -3,9 +3,13 @@ package server
 import (
 	"context"
 	"fmt"
+	"hash/crc32"
+	"io"
+	"sync"
+	"time"
 
 	"github.com/nats-io/nats.go"
-	"github.com/nats-io/nuid"
+	"github.com/pkg/errors"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -13,6 +17,13 @@ import (
 	"github.com/liftbridge-io/liftbridge/server/commitlog"
 	proto "github.com/liftbridge-io/liftbridge/server/protocol"
 )
+
+const (
+	waitForNewMessages int64 = -1
+	asyncAckTimeout          = 5 * time.Second
+)
+
+var hasher = crc32.ChecksumIEEE
 
 // apiServer implements the gRPC server interface clients interact with.
 type apiServer struct {
@@ -60,6 +71,7 @@ func (a *apiServer) CreateStream(ctx context.Context, req *client.CreateStreamRe
 		Name:       req.Name,
 		Subject:    req.Subject,
 		Partitions: partitions,
+		Config:     getStreamConfig(req),
 	}
 
 	if e := a.metadata.CreateStream(ctx, &proto.CreateStreamOp{Stream: stream}); e != nil {
@@ -122,39 +134,48 @@ func (a *apiServer) PauseStream(ctx context.Context, req *client.PauseStreamRequ
 	return resp, nil
 }
 
+// SetStreamReadonly sets the readonly status on a stream's partitions. If no
+// partitions are specified, all of the stream's partitions will have their
+// readonly status set.
+func (a *apiServer) SetStreamReadonly(ctx context.Context, req *client.SetStreamReadonlyRequest) (
+	*client.SetStreamReadonlyResponse, error) {
+
+	resp := &client.SetStreamReadonlyResponse{}
+	a.logger.Debugf("api: SetStreamReadonly [name=%s, partitions=%v, readonly=%v]",
+		req.Name, req.Partitions, req.Readonly)
+
+	if len(req.Partitions) == 0 {
+		stream := a.metadata.GetStream(req.Name)
+		if stream == nil {
+			return nil, status.Error(codes.NotFound, "stream not found")
+		}
+		for _, partition := range stream.GetPartitions() {
+			req.Partitions = append(req.Partitions, partition.Id)
+		}
+	}
+
+	if e := a.metadata.SetStreamReadonly(ctx, &proto.SetStreamReadonlyOp{
+		Stream:     req.Name,
+		Partitions: req.Partitions,
+		Readonly:   req.Readonly,
+	}); e != nil {
+		a.logger.Errorf("api: Failed to set stream readonly flag %v: %v", req.Name, e.Err())
+		return nil, e.Err()
+	}
+
+	return resp, nil
+}
+
 // Subscribe creates an ephemeral subscription for the given stream partition.
 // It begins to receive messages starting at the given offset and waits for new
 // messages when it reaches the end of the partition. Use the request context
 // to close the subscription.
 func (a *apiServer) Subscribe(req *client.SubscribeRequest, out client.API_SubscribeServer) error {
-	a.logger.Debugf("api: Subscribe [stream=%s, partition=%d, start=%s, offset=%d, timestamp=%d]",
-		req.Stream, req.Partition, req.StartPosition, req.StartOffset, req.StartTimestamp)
-
-	partition := a.metadata.GetPartition(req.Stream, req.Partition)
-	if partition == nil {
-		a.logger.Errorf("api: Failed to subscribe to partition "+
-			"[stream=%s, partition=%d]: no such partition",
-			req.Stream, req.Partition)
-		return status.Error(codes.NotFound, "No such partition")
-	}
-
-	leader, _ := partition.GetLeader()
-	if leader != a.config.Clustering.ServerID {
-		if req.ReadISRReplica {
-			a.logger.Info("api: Accepting subscription to partition %s: server not stream leader", partition)
-		} else {
-			a.logger.Errorf("api: Failed to subscribe to partition %s: server not stream leader", partition)
-			return status.Error(codes.FailedPrecondition, "Server not partition leader")
-		}
-	}
-
-	cancel := make(chan struct{})
-	defer close(cancel)
-	ch, errCh, err := a.subscribe(out.Context(), partition, req, cancel)
+	msgC, errC, cancel, err := a.SubscribeInternal(out.Context(), req)
 	if err != nil {
-		a.logger.Errorf("api: Failed to subscribe to partition %s: %v", partition, err.Err())
-		return err.Err()
+		return err
 	}
+	defer cancel()
 
 	// Send an empty message which signals the subscription was successfully
 	// created.
@@ -166,14 +187,52 @@ func (a *apiServer) Subscribe(req *client.SubscribeRequest, out client.API_Subsc
 		select {
 		case <-out.Context().Done():
 			return nil
-		case m := <-ch:
+		case m := <-msgC:
 			if err := out.Send(m); err != nil {
 				return err
 			}
-		case err := <-errCh:
+		case err := <-errC:
 			return err.Err()
 		}
 	}
+}
+
+// Subscribe creates an ephemeral subscription for the given stream partition.
+// It begins to receive messages starting at the given offset and waits for new
+// messages when it reaches the end of the partition. Use the request context
+// to close the subscription. This is a non-gRPC API for internal use.
+func (a *apiServer) SubscribeInternal(ctx context.Context, req *client.SubscribeRequest) (
+	<-chan *client.Message, <-chan *status.Status, func(), error) {
+
+	a.logger.Debugf("api: Subscribe [stream=%s, partition=%d, start=%s, offset=%d, timestamp=%d]",
+		req.Stream, req.Partition, req.StartPosition, req.StartOffset, req.StartTimestamp)
+
+	partition := a.metadata.GetPartition(req.Stream, req.Partition)
+	if partition == nil {
+		a.logger.Errorf("api: Failed to subscribe to partition "+
+			"[stream=%s, partition=%d]: no such partition",
+			req.Stream, req.Partition)
+		return nil, nil, nil, status.Error(codes.NotFound, "No such partition")
+	}
+
+	leader, _ := partition.GetLeader()
+	if leader != a.config.Clustering.ServerID {
+		if req.ReadISRReplica {
+			a.logger.Info("api: Accepting subscription to partition %s: server not stream leader", partition)
+		} else {
+			a.logger.Errorf("api: Failed to subscribe to partition %s: server not stream leader", partition)
+			return nil, nil, nil, status.Error(codes.FailedPrecondition, "Server not partition leader")
+		}
+	}
+
+	cancel := make(chan struct{})
+	ch, errCh, err := a.subscribe(ctx, partition, req, cancel)
+	if err != nil {
+		a.logger.Errorf("api: Failed to subscribe to partition %s: %v", partition, err.Err())
+		return nil, nil, nil, err.Err()
+	}
+
+	return ch, errCh, func() { close(cancel) }, nil
 }
 
 // FetchMetadata retrieves the latest cluster metadata, including stream broker
@@ -191,26 +250,49 @@ func (a *apiServer) FetchMetadata(ctx context.Context, req *client.FetchMetadata
 	return resp, nil
 }
 
+// FetchPartitionMetadata retrieves metatadata from the partition leader. This
+// is mainly useful when client would like to know the high watermark and
+// newest offset for a partition.
+func (a *apiServer) FetchPartitionMetadata(ctx context.Context, req *client.FetchPartitionMetadataRequest) (
+	*client.FetchPartitionMetadataResponse, error) {
+	a.logger.Debugf("api: FetchPartitionMetadata [stream=%s, partition=%s]", req.Stream, req.Partition)
+
+	resp, err := a.metadata.FetchPartitionMetadata(ctx, req)
+	if err != nil {
+		a.logger.Errorf("api: Failed to fetch partition metadata: %v", err.Err())
+		return nil, err.Err()
+	}
+	return resp, nil
+}
+
 // Publish a new message to a stream. If the AckPolicy is not NONE and a
 // deadline is provided, this will synchronously block until the ack is
 // received. If the ack is not received in time, a DeadlineExceeded status code
-// is returned.
+// is returned. A FailedPrecondition status code is returned if the partition is
+// readonly.
 func (a *apiServer) Publish(ctx context.Context, req *client.PublishRequest) (
 	*client.PublishResponse, error) {
+
+	// TODO: Deprecate in favor of PublishAsync and log a warning.
 	a.logger.Debugf("api: Publish [stream=%s, partition=%d]", req.Stream, req.Partition)
 
-	subject, err := a.getPublishSubject(req)
-	if err != nil {
-		return nil, err
+	subject, e := a.getPublishSubject(req)
+	if e != nil {
+		a.logger.Errorf("api: Failed to publish message: %v", e.Message)
+		return nil, convertPublishAsyncError(e)
 	}
 
-	err = a.resumeStream(ctx, req.Stream, req.Partition)
-	if err != nil {
+	if e := a.ensureStreamNotReadonly(req.Stream, req.Partition); e != nil {
+		return nil, convertPublishAsyncError(e)
+	}
+
+	if err := a.resumeStream(ctx, req.Stream, req.Partition); err != nil {
+		a.logger.Errorf("api: Failed to resume stream: %v", err)
 		return nil, err
 	}
 
 	if req.AckInbox == "" {
-		req.AckInbox = nuid.Next()
+		req.AckInbox = a.getAckInbox()
 	}
 
 	var (
@@ -228,10 +310,30 @@ func (a *apiServer) Publish(ctx context.Context, req *client.PublishRequest) (
 	)
 
 	ack, err := a.publish(ctx, subject, req.AckInbox, req.AckPolicy, msg)
+	if err != nil {
+		a.logger.Errorf("api: Failed to publish message: %v", err)
+		return nil, err
+	}
+
 	resp.Ack = ack
+	return resp, nil
+}
 
-	return resp, err
+// Asynchronously publish messages to a stream. This returns a stream which
+// will yield PublishResponses for messages whose AckPolicy is not NONE.
+func (a *apiServer) PublishAsync(stream client.API_PublishAsyncServer) error {
+	session := a.newPublishAsyncSession(stream)
+	if err := session.dispatchAcks(); err != nil {
+		return err
+	}
+	defer session.close()
 
+	if err := session.publishLoop(); err != nil {
+		a.logger.Errorf("api: Failed to publish async message: %v", err)
+		return err
+	}
+
+	return nil
 }
 
 // Publish a Liftbridge message to a NATS subject. If the AckPolicy is not NONE
@@ -243,7 +345,7 @@ func (a *apiServer) PublishToSubject(ctx context.Context, req *client.PublishToS
 	a.logger.Debugf("api: PublishToSubject [subject=%s]", req.Subject)
 
 	if req.AckInbox == "" {
-		req.AckInbox = nuid.Next()
+		req.AckInbox = a.getAckInbox()
 	}
 
 	var (
@@ -260,9 +362,84 @@ func (a *apiServer) PublishToSubject(ctx context.Context, req *client.PublishToS
 	)
 
 	ack, err := a.publish(ctx, req.Subject, req.AckInbox, req.AckPolicy, msg)
-	resp.Ack = ack
+	if err != nil {
+		a.logger.Errorf("api: Failed to publish message: %v", err)
+		return nil, err
+	}
 
-	return resp, err
+	resp.Ack = ack
+	return resp, nil
+}
+
+// SetCursor stores a cursor position for a particular stream partition which
+// is uniquely identified by an opaque string.
+//
+// NOTE: This is a beta endpoint and is subject to change. It is not included
+// as part of Liftbridge's semantic versioning scheme.
+func (a *apiServer) SetCursor(ctx context.Context, req *client.SetCursorRequest) (
+	*client.SetCursorResponse, error) {
+	a.logger.Debugf("api: SetCursor [stream=%s, partition=%d, cursorId=%s, offset=%d]",
+		req.Stream, req.Partition, req.CursorId, req.Offset)
+
+	if req.Stream == "" {
+		return nil, status.Error(codes.InvalidArgument, "No stream provided")
+	}
+	if req.CursorId == "" {
+		return nil, status.Error(codes.InvalidArgument, "No cursorId provided")
+	}
+
+	if status := a.cursors.SetCursor(ctx, req.Stream, req.CursorId, req.Partition, req.Offset); status != nil {
+		return nil, status.Err()
+	}
+	return new(client.SetCursorResponse), nil
+}
+
+// FetchCursor retrieves a partition cursor position.
+//
+// NOTE: This is a beta endpoint and is subject to change. It is not included
+// as part of Liftbridge's semantic versioning scheme.
+func (a *apiServer) FetchCursor(ctx context.Context, req *client.FetchCursorRequest) (
+	*client.FetchCursorResponse, error) {
+	a.logger.Debugf("api: FetchCursor [stream=%s, partition=%d, cursorId=%s]",
+		req.Stream, req.Partition, req.CursorId)
+
+	if req.Stream == "" {
+		return nil, status.Error(codes.InvalidArgument, "No stream provided")
+	}
+	if req.CursorId == "" {
+		return nil, status.Error(codes.InvalidArgument, "No cursorId provided")
+	}
+
+	offset, status := a.cursors.GetCursor(ctx, req.Stream, req.CursorId, req.Partition)
+	if status != nil {
+		return nil, status.Err()
+	}
+	return &client.FetchCursorResponse{Offset: offset}, nil
+}
+
+func (a *apiServer) ensureStreamNotReadonly(name string, partitionID int32) *client.PublishAsyncError {
+	stream := a.metadata.GetStream(name)
+	if stream == nil {
+		return &client.PublishAsyncError{
+			Code:    client.PublishAsyncError_NOT_FOUND,
+			Message: fmt.Sprintf("no such stream: %s", name),
+		}
+	}
+	partition := stream.GetPartition(partitionID)
+	if partition == nil {
+		return &client.PublishAsyncError{
+			Code:    client.PublishAsyncError_NOT_FOUND,
+			Message: fmt.Sprintf("no such partition: %d", partitionID),
+		}
+	}
+	if partition.IsReadonly() {
+		return &client.PublishAsyncError{
+			Code:    client.PublishAsyncError_READONLY,
+			Message: fmt.Sprintf("readonly partition: %d", partitionID),
+		}
+	}
+
+	return nil
 }
 
 func (a *apiServer) resumeStream(ctx context.Context, streamName string, partitionID int32) error {
@@ -302,7 +479,6 @@ func (a *apiServer) resumeStream(ctx context.Context, streamName string, partiti
 		Partitions: toResume,
 	}
 	if e := a.metadata.ResumeStream(ctx, req); e != nil {
-		a.logger.Errorf("api: Failed to resume stream: %v", e.Err())
 		return e.Err()
 	}
 
@@ -311,13 +487,19 @@ func (a *apiServer) resumeStream(ctx context.Context, streamName string, partiti
 	return nil
 }
 
-func (a *apiServer) getPublishSubject(req *client.PublishRequest) (string, error) {
+func (a *apiServer) getPublishSubject(req *client.PublishRequest) (string, *client.PublishAsyncError) {
 	if req.Stream == "" {
-		return "", status.Error(codes.InvalidArgument, "No stream provided")
+		return "", &client.PublishAsyncError{
+			Code:    client.PublishAsyncError_BAD_REQUEST,
+			Message: "no stream provided",
+		}
 	}
 	stream := a.metadata.GetStream(req.Stream)
 	if stream == nil {
-		return "", status.Error(codes.NotFound, fmt.Sprintf("No such stream: %s", req.Stream))
+		return "", &client.PublishAsyncError{
+			Code:    client.PublishAsyncError_NOT_FOUND,
+			Message: fmt.Sprintf("no such stream: %s", req.Stream),
+		}
 	}
 	subject := stream.GetSubject()
 	if req.Partition > 0 {
@@ -331,8 +513,7 @@ func (a *apiServer) publish(ctx context.Context, subject, ackInbox string,
 
 	buf, err := proto.MarshalPublish(msg)
 	if err != nil {
-		a.logger.Errorf("api: Failed to marshal message: %v", err.Error())
-		return nil, err
+		return nil, errors.Wrap(err, "failed to marshal message")
 	}
 
 	// If AckPolicy is NONE or a timeout isn't specified, then we will fire and
@@ -340,8 +521,7 @@ func (a *apiServer) publish(ctx context.Context, subject, ackInbox string,
 	_, hasDeadline := ctx.Deadline()
 	if ackPolicy == client.AckPolicy_NONE || !hasDeadline {
 		if err := a.ncPublishes.Publish(subject, buf); err != nil {
-			a.logger.Errorf("api: Failed to publish message: %v", err)
-			return nil, err
+			return nil, errors.Wrap(err, "failed to publish to NATS")
 		}
 		return nil, nil
 	}
@@ -355,34 +535,27 @@ func (a *apiServer) publishSync(ctx context.Context, subject,
 
 	sub, err := a.ncPublishes.SubscribeSync(ackInbox)
 	if err != nil {
-		a.logger.Errorf("api: Failed to subscribe to ack inbox: %v", err)
-		return nil, err
+		return nil, errors.Wrap(err, "failed to subscribe to ack inbox")
 	}
 	if err := sub.AutoUnsubscribe(1); err != nil {
-		a.logger.Errorf("api: Failed to auto unsubscribe from ack inbox: %v", err)
-		return nil, err
+		return nil, errors.Wrap(err, "failed to auto unsubscribe from ack inbox")
 	}
 
 	if err := a.ncPublishes.Publish(subject, msg); err != nil {
-		a.logger.Errorf("api: Failed to publish message: %v", err)
-		return nil, err
+		return nil, errors.Wrap(err, "failed to publish to NATS")
 	}
 
 	ackMsg, err := sub.NextMsgWithContext(ctx)
 	if err != nil {
 		if err == nats.ErrTimeout {
-			a.logger.Errorf("api: Ack for publish timed out")
 			err = status.Error(codes.DeadlineExceeded, err.Error())
-		} else {
-			a.logger.Errorf("api: Failed to get ack for publish: %v", err)
 		}
 		return nil, err
 	}
 
 	ack, err := proto.UnmarshalAck(ackMsg.Data)
 	if err != nil {
-		a.logger.Errorf("api: Invalid ack for publish: %v", err)
-		return nil, err
+		return nil, errors.Wrap(err, "Invalid ack for publish")
 	}
 	return ack, nil
 }
@@ -395,9 +568,36 @@ func (a *apiServer) subscribe(ctx context.Context, partition *partition,
 	req *client.SubscribeRequest, cancel chan struct{}) (
 	<-chan *client.Message, <-chan *status.Status, *status.Status) {
 
+	if req.Resume {
+		if err := a.resumeStream(ctx, req.Stream, req.Partition); err != nil {
+			return nil, nil, status.New(
+				codes.Internal, fmt.Sprintf("Failed to resume stream: %v", err))
+		}
+
+		// Resuming a partition creates a new one, so we have to get a pointer
+		// to it.
+		partition = a.metadata.GetPartition(req.Stream, req.Partition)
+		if partition == nil {
+			a.logger.Errorf("api: Failed to subscribe to partition "+
+				"[stream=%s, partition=%d]: no such partition",
+				req.Stream, req.Partition)
+			return nil, nil, status.New(codes.NotFound, "No such partition")
+		}
+	}
+
 	startOffset, st := getStartOffset(req, partition.log)
 	if st != nil {
 		return nil, nil, st
+	}
+
+	stopOffset, st := getStopOffset(req, partition.log)
+	if st != nil {
+		return nil, nil, st
+	}
+
+	if stopOffset != waitForNewMessages && stopOffset < startOffset {
+		return nil, nil, status.New(
+			codes.InvalidArgument, fmt.Sprintf("Stop offset is before start offset: %d < %d", stopOffset, startOffset))
 	}
 
 	var (
@@ -411,6 +611,10 @@ func (a *apiServer) subscribe(ctx context.Context, partition *partition,
 	}
 
 	a.startGoroutine(func() {
+		// Update the active subscriber count.
+		partition.IncreaseSubscriberCount()
+		defer partition.DecreaseSubscriberCount()
+
 		headersBuf := make([]byte, 28)
 		for {
 			// TODO: this could be more efficient.
@@ -427,6 +631,9 @@ func (a *apiServer) subscribe(ctx context.Context, partition *partition,
 						code = codes.FailedPrecondition
 					}
 					s = status.New(code, err.Error())
+				} else if err == commitlog.ErrCommitLogReadonly {
+					// Partition was set to readonly while subscribed.
+					s = status.New(codes.ResourceExhausted, "End of readonly partition")
 				} else {
 					s = status.Convert(err)
 				}
@@ -456,6 +663,15 @@ func (a *apiServer) subscribe(ctx context.Context, partition *partition,
 			case <-cancel:
 				return
 			}
+			if offset == stopOffset {
+				s := status.New(codes.ResourceExhausted, "Stop offset reached")
+
+				select {
+				case errCh <- s:
+				case <-cancel:
+				}
+				return
+			}
 		}
 	})
 
@@ -468,7 +684,7 @@ func getStartOffset(req *client.SubscribeRequest, log commitlog.CommitLog) (int6
 	case client.StartPosition_OFFSET:
 		startOffset = req.StartOffset
 	case client.StartPosition_TIMESTAMP:
-		offset, err := log.OffsetForTimestamp(req.StartTimestamp)
+		offset, err := log.EarliestOffsetAfterTimestamp(req.StartTimestamp)
 		if err != nil {
 			return startOffset, status.New(
 				codes.Internal, fmt.Sprintf("Failed to lookup offset for timestamp: %v", err))
@@ -492,4 +708,253 @@ func getStartOffset(req *client.SubscribeRequest, log commitlog.CommitLog) (int6
 	}
 
 	return startOffset, nil
+}
+
+func getStopOffset(req *client.SubscribeRequest, log commitlog.CommitLog) (int64, *status.Status) {
+	var stopOffset int64
+	switch req.StopPosition {
+	case client.StopPosition_STOP_ON_CANCEL:
+		stopOffset = waitForNewMessages
+		if log.IsReadonly() {
+			stopOffset = log.NewestOffset()
+		}
+	case client.StopPosition_STOP_OFFSET:
+		stopOffset = req.StopOffset
+	case client.StopPosition_STOP_TIMESTAMP:
+		var err error
+		stopOffset, err = log.LatestOffsetBeforeTimestamp(req.StopTimestamp)
+		if err != nil {
+			return stopOffset, status.New(
+				codes.Internal, fmt.Sprintf("Failed to lookup offset for timestamp: %v", err))
+		}
+	case client.StopPosition_STOP_LATEST:
+		stopOffset = log.NewestOffset()
+		if stopOffset == -1 {
+			return stopOffset, status.New(codes.ResourceExhausted, "Stream is empty")
+		}
+	default:
+		return stopOffset, status.New(
+			codes.InvalidArgument,
+			fmt.Sprintf("Unknown StopPosition %s", req.StopPosition))
+	}
+
+	return stopOffset, nil
+}
+
+func getStreamConfig(req *client.CreateStreamRequest) *proto.StreamConfig {
+	config := new(proto.StreamConfig)
+	if req.RetentionMaxAge != nil {
+		config.RetentionMaxAge = &proto.NullableInt64{Value: req.RetentionMaxAge.Value}
+	}
+	if req.CleanerInterval != nil {
+		config.CleanerInterval = &proto.NullableInt64{Value: req.CleanerInterval.Value}
+	}
+	if req.SegmentMaxBytes != nil {
+		config.SegmentMaxBytes = &proto.NullableInt64{Value: req.SegmentMaxBytes.Value}
+	}
+	if req.SegmentMaxAge != nil {
+		config.SegmentMaxAge = &proto.NullableInt64{Value: req.SegmentMaxAge.Value}
+	}
+	if req.CompactMaxGoroutines != nil {
+		config.CompactMaxGoroutines = &proto.NullableInt32{Value: req.CompactMaxGoroutines.Value}
+	}
+	if req.RetentionMaxBytes != nil {
+		config.RetentionMaxBytes = &proto.NullableInt64{Value: req.RetentionMaxBytes.Value}
+	}
+	if req.RetentionMaxMessages != nil {
+		config.RetentionMaxMessages = &proto.NullableInt64{Value: req.RetentionMaxMessages.Value}
+	}
+	if req.CompactEnabled != nil {
+		config.CompactEnabled = &proto.NullableBool{Value: req.CompactEnabled.Value}
+	}
+	if req.AutoPauseTime != nil {
+		config.AutoPauseTime = &proto.NullableInt64{Value: req.AutoPauseTime.Value}
+	}
+	if req.AutoPauseDisableIfSubscribers != nil {
+		config.AutoPauseDisableIfSubscribers = &proto.NullableBool{Value: req.AutoPauseDisableIfSubscribers.Value}
+	}
+	if req.MinIsr != nil {
+		config.MinIsr = &proto.NullableInt32{Value: req.MinIsr.Value}
+	}
+	return config
+}
+
+func convertPublishAsyncError(err *client.PublishAsyncError) error {
+	if err == nil {
+		return nil
+	}
+	var code codes.Code
+	switch err.Code {
+	case client.PublishAsyncError_NOT_FOUND:
+		code = codes.NotFound
+	case client.PublishAsyncError_BAD_REQUEST:
+		code = codes.InvalidArgument
+	case client.PublishAsyncError_READONLY:
+		code = codes.FailedPrecondition
+	case client.PublishAsyncError_UNKNOWN:
+		fallthrough
+	default:
+		code = codes.Unknown
+	}
+
+	return status.Error(code, err.Message)
+}
+
+// publishAsyncSession maintains state for long-lived PublishAsync RPCs.
+type publishAsyncSession struct {
+	*apiServer
+	mu       sync.Mutex
+	inflight int32
+	stream   client.API_PublishAsyncServer
+	ackInbox string
+	sub      *nats.Subscription
+}
+
+func (a *apiServer) newPublishAsyncSession(stream client.API_PublishAsyncServer) *publishAsyncSession {
+	return &publishAsyncSession{
+		apiServer: a,
+		stream:    stream,
+		ackInbox:  a.getAckInbox(),
+	}
+}
+
+// dispatchAcks sets up a subscription on the ack inbox to dispatch acks for
+// published messages back to the client.
+func (p *publishAsyncSession) dispatchAcks() error {
+	sub, err := p.ncPublishes.Subscribe(p.ackInbox, func(m *nats.Msg) {
+		ack, err := proto.UnmarshalAck(m.Data)
+		if err != nil {
+			p.logger.Errorf("api: Invalid ack received on ack inbox: %v", err)
+			return
+		}
+		p.mu.Lock()
+		p.inflight--
+		if p.inflight < 0 {
+			p.inflight = 0
+		}
+		p.mu.Unlock()
+		if err := p.stream.Send(&client.PublishResponse{CorrelationId: ack.CorrelationId, Ack: ack}); err != nil {
+			p.logger.Errorf("api: Failed to send PublishAsync response: %v", err)
+		}
+	})
+	if err != nil {
+		return err
+	}
+	sub.SetPendingLimits(-1, -1)
+	p.sub = sub
+	return nil
+}
+
+// publishLoop is a long-lived loop that receives messages from the client and
+// publishes them. It returns nil on completion or an error which is terminal.
+// If the client closes the stream, this will attempt to wait for remaining
+// acks for any in-flight messages before ending the session.
+func (p *publishAsyncSession) publishLoop() error {
+	for {
+		req, err := p.stream.Recv()
+		if err != nil {
+			if err == io.EOF || status.Code(err) == codes.Canceled {
+				p.waitForInflight()
+				return nil
+			}
+			return err
+		}
+
+		if e := p.ensureStreamNotReadonly(req.Stream, req.Partition); e != nil {
+			p.logger.Errorf("api: Failed to publish async message: %v", e.Message)
+			p.sendPublishAsyncError(req.CorrelationId, e)
+			continue
+		}
+
+		req.AckInbox = p.ackInbox
+
+		p.logger.Debugf("api: PublishAsync [stream=%s, partition=%d]", req.Stream, req.Partition)
+
+		subject, e := p.getPublishSubject(req)
+		if e != nil {
+			p.logger.Errorf("api: Failed to publish async message: %v", e.Message)
+			p.sendPublishAsyncError(req.CorrelationId, e)
+			continue
+		}
+		if err := p.resumeStream(p.stream.Context(), req.Stream, req.Partition); err != nil {
+			err = errors.Wrap(err, "failed to resume stream")
+			p.logger.Errorf("api: Failed to publish async message: %v", err)
+			p.sendPublishAsyncError(req.CorrelationId, &client.PublishAsyncError{
+				Code:    client.PublishAsyncError_INTERNAL,
+				Message: err.Error(),
+			})
+			continue
+		}
+		msg, err := proto.MarshalPublish(&client.Message{
+			Key:           req.Key,
+			Value:         req.Value,
+			Stream:        req.Stream,
+			Subject:       subject,
+			Headers:       req.Headers,
+			AckInbox:      req.AckInbox,
+			CorrelationId: req.CorrelationId,
+			AckPolicy:     req.AckPolicy,
+		})
+		if err != nil {
+			err = errors.Wrap(err, "failed to marshal message")
+			p.logger.Errorf("api: Failed to publish async message: %v", err)
+			p.sendPublishAsyncError(req.CorrelationId, &client.PublishAsyncError{
+				Code:    client.PublishAsyncError_INTERNAL,
+				Message: err.Error(),
+			})
+			continue
+		}
+		if err := p.ncPublishes.Publish(subject, msg); err != nil {
+			err = errors.Wrap(err, "failed to publish to NATS")
+			p.logger.Errorf("api: Failed to publish async message: %v", err)
+			p.sendPublishAsyncError(req.CorrelationId, &client.PublishAsyncError{
+				Code:    client.PublishAsyncError_INTERNAL,
+				Message: err.Error(),
+			})
+		}
+
+		// Increment in-flight count if we're expecting an ack.
+		if req.AckPolicy != client.AckPolicy_NONE {
+			p.mu.Lock()
+			p.inflight++
+			p.mu.Unlock()
+		}
+	}
+}
+
+// sendPublishAsyncError sends a PublishResponse containing an error back to
+// the client.
+func (p *publishAsyncSession) sendPublishAsyncError(correlationID string, err *client.PublishAsyncError) {
+	resp := &client.PublishResponse{
+		CorrelationId: correlationID,
+		// Set an Ack with an empty correlation id so we don't break older
+		// clients that are unaware of AsyncError. TODO (2.0.0): Remove when
+		// clients are expected to check for AsyncError.
+		Ack:        &client.Ack{CorrelationId: ""},
+		AsyncError: err,
+	}
+	if err := p.stream.Send(resp); err != nil {
+		p.logger.Errorf("api: Failed to send PublishAsync error response: %v", err)
+	}
+}
+
+// waitForInflight attempts to wait for remaining acks for any in-flight
+// messages.
+func (p *publishAsyncSession) waitForInflight() {
+	deadline := time.Now().Add(asyncAckTimeout)
+	for time.Now().Before(deadline) {
+		p.mu.Lock()
+		inflight := p.inflight
+		p.mu.Unlock()
+		if inflight == 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func (p *publishAsyncSession) close() {
+	if p.sub != nil {
+		p.sub.Unsubscribe()
+	}
 }
