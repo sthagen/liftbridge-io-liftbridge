@@ -1,6 +1,7 @@
 ---
-id: quick-start
+id: version-v1.4.0-quick-start
 title: Quick Start
+original_id: quick-start
 ---
 
 There are three ways to get started running Liftbridge on your machine:
@@ -43,7 +44,7 @@ only be set on one server when bootstrapping a cluster.**
 
 ```shell
 $ liftbridge --raft-bootstrap-seed
-INFO[2020-10-15 14:29:50] Liftbridge Version:        v1.4.1
+INFO[2020-10-15 14:29:50] Liftbridge Version:        v1.4.0
 INFO[2020-10-15 14:29:50] Server ID:                 4nbhBr66WnRsy0I5oKF9bo
 INFO[2020-10-15 14:29:50] Namespace:                 liftbridge-default
 INFO[2020-10-15 14:29:50] Default Retention Policy:  [Age: 1 week, Compact: false]
@@ -57,7 +58,7 @@ We set the `--data-dir` and `--port` flags to avoid clobbering the first server.
 
 ```shell
 $ liftbridge --data-dir /tmp/liftbridge/server-2 --port=9293
-INFO[2020-10-15 14:30:48] Liftbridge Version:        v1.4.1
+INFO[2020-10-15 14:30:48] Liftbridge Version:        v1.4.0
 INFO[2020-10-15 14:30:48] Server ID:                 lbW05esZTab3guEwcmWD9M
 INFO[2020-10-15 14:30:48] Namespace:                 liftbridge-default
 INFO[2020-10-15 14:30:48] Default Retention Policy:  [Age: 1 week, Compact: false]

@@ -1,6 +1,7 @@
 ---
-id: configuration
+id: version-v1.4.0-configuration
 title: Configuration
+original_id: configuration
 ---
 
 Liftbridge provides limited configuration through command-line flags and full
@@ -24,7 +25,7 @@ USAGE:
    liftbridge [global options] command [command options] [arguments...]
 
 VERSION:
-   v1.4.1
+   v1.4.0
 
 COMMANDS:
    help, h  Shows a list of commands or help for one command
