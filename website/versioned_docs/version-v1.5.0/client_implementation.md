@@ -1,6 +1,7 @@
 ---
-id: client-implementation
+id: version-v1.5.0-client-implementation
 title: Client Implementation Guidance
+original_id: client-implementation
 ---
 
 This documentation provides guidance on implementing a [client

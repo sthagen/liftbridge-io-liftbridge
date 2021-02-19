@@ -86,12 +86,13 @@ func stopFollowing(t *testing.T, p *partition) {
 func TestStreamLeaderFailover(t *testing.T) {
 	defer cleanupStorage(t)
 
-	// Use a central NATS server.
+	// Use an external NATS server.
 	ns := natsdTest.RunDefaultServer()
 	defer ns.Shutdown()
 
 	// Configure first server.
 	s1Config := getTestConfig("a", true, 5050)
+	s1Config.EmbeddedNATS = false
 	s1Config.Clustering.ReplicaMaxLeaderTimeout = time.Second
 	s1Config.Clustering.ReplicaMaxIdleWait = 500 * time.Millisecond
 	s1Config.Clustering.ReplicaFetchTimeout = 500 * time.Millisecond
@@ -126,6 +127,20 @@ func TestStreamLeaderFailover(t *testing.T) {
 	defer cancel()
 	err = client.CreateStream(ctx, subject, name, lift.ReplicationFactor(3))
 	require.NoError(t, err)
+
+	leader := getPartitionLeader(t, 10*time.Second, name, 0, servers...)
+
+	// Check partition load counts.
+	for _, server := range servers {
+		partitionCounts := server.metadata.BrokerPartitionCounts()
+		require.Len(t, partitionCounts, 3)
+		for _, s := range servers {
+			require.Equal(t, 1, partitionCounts[s.config.Clustering.ServerID])
+		}
+		leaderCounts := server.metadata.BrokerLeaderCounts()
+		require.Len(t, leaderCounts, 1)
+		require.Equal(t, 1, leaderCounts[leader.config.Clustering.ServerID])
+	}
 
 	num := 100
 	expected := make([]*message, num)
@@ -172,7 +187,6 @@ func TestStreamLeaderFailover(t *testing.T) {
 	waitForHW(t, 5*time.Second, name, 0, int64(num-1), servers...)
 
 	// Kill the stream leader.
-	leader := getPartitionLeader(t, 10*time.Second, name, 0, servers...)
 	leader.Stop()
 	followers := []*Server{}
 	for _, s := range servers {
@@ -183,7 +197,7 @@ func TestStreamLeaderFailover(t *testing.T) {
 	}
 
 	// Wait for new leader to be elected.
-	getPartitionLeader(t, 10*time.Second, name, 0, followers...)
+	leader = getPartitionLeader(t, 10*time.Second, name, 0, followers...)
 
 	// Make sure the new leader's log is consistent.
 	i = 0
@@ -208,6 +222,13 @@ func TestStreamLeaderFailover(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("Did not receive all expected messages")
 	}
+
+	// Check partition load counts.
+	partitionCounts := leader.metadata.BrokerPartitionCounts()
+	require.Len(t, partitionCounts, 3)
+	require.Equal(t, 1, partitionCounts[leader.config.Clustering.ServerID])
+	leaderCounts := leader.metadata.BrokerLeaderCounts()
+	require.Equal(t, 1, leaderCounts[leader.config.Clustering.ServerID])
 }
 
 // Ensure the leader commits when the ISR shrinks if it causes pending messages
@@ -215,12 +236,13 @@ func TestStreamLeaderFailover(t *testing.T) {
 func TestCommitOnISRShrink(t *testing.T) {
 	defer cleanupStorage(t)
 
-	// Use a central NATS server.
+	// Use an external NATS server.
 	ns := natsdTest.RunDefaultServer()
 	defer ns.Shutdown()
 
 	// Configure first server.
 	s1Config := getTestConfig("a", true, 5050)
+	s1Config.EmbeddedNATS = false
 	s1Config.Clustering.ReplicaMaxLagTime = time.Second
 	s1Config.Clustering.ReplicaFetchTimeout = 100 * time.Millisecond
 	s1 := runServerWithConfig(t, s1Config)
@@ -228,6 +250,7 @@ func TestCommitOnISRShrink(t *testing.T) {
 
 	// Configure second server.
 	s2Config := getTestConfig("b", false, 5051)
+	s2Config.EmbeddedNATS = false
 	s2Config.Clustering.ReplicaMaxLagTime = time.Second
 	s2Config.Clustering.ReplicaFetchTimeout = 100 * time.Millisecond
 	s2 := runServerWithConfig(t, s2Config)
@@ -235,6 +258,7 @@ func TestCommitOnISRShrink(t *testing.T) {
 
 	// Configure third server.
 	s3Config := getTestConfig("c", false, 5052)
+	s3Config.EmbeddedNATS = false
 	s3Config.Clustering.ReplicaMaxLagTime = time.Second
 	s3Config.Clustering.ReplicaFetchTimeout = 100 * time.Millisecond
 	s3 := runServerWithConfig(t, s3Config)
@@ -296,12 +320,13 @@ func TestCommitOnISRShrink(t *testing.T) {
 func TestAckPolicyLeader(t *testing.T) {
 	defer cleanupStorage(t)
 
-	// Use a central NATS server.
+	// Use an external NATS server.
 	ns := natsdTest.RunDefaultServer()
 	defer ns.Shutdown()
 
 	// Configure first server.
 	s1Config := getTestConfig("a", true, 5050)
+	s1Config.EmbeddedNATS = false
 	s1 := runServerWithConfig(t, s1Config)
 	defer s1.Stop()
 
@@ -358,12 +383,13 @@ func TestAckPolicyLeader(t *testing.T) {
 func TestCommitOnRestart(t *testing.T) {
 	defer cleanupStorage(t)
 
-	// Use a central NATS server.
+	// Use an external NATS server.
 	ns := natsdTest.RunDefaultServer()
 	defer ns.Shutdown()
 
 	// Configure first server.
 	s1Config := getTestConfig("a", true, 5050)
+	s1Config.EmbeddedNATS = false
 	s1Config.Clustering.MinISR = 2
 	s1 := runServerWithConfig(t, s1Config)
 	defer s1.Stop()
@@ -479,10 +505,6 @@ func TestCommitOnRestart(t *testing.T) {
 // and then immediately becomes the leader.
 func TestTruncateFastLeaderElection(t *testing.T) {
 	defer cleanupStorage(t)
-
-	// Use a central NATS server.
-	ns := natsdTest.RunDefaultServer()
-	defer ns.Shutdown()
 
 	// Configure first server.
 	s1Config := getTestConfig("a", true, 5050)
@@ -615,12 +637,13 @@ func TestTruncateFastLeaderElection(t *testing.T) {
 func TestTruncatePreventReplicaDivergence(t *testing.T) {
 	defer cleanupStorage(t)
 
-	// Use a central NATS server.
+	// Use an external NATS server.
 	ns := natsdTest.RunDefaultServer()
 	defer ns.Shutdown()
 
 	// Configure first server.
 	s1Config := getTestConfig("a", true, 5050)
+	s1Config.EmbeddedNATS = false
 	s1Config.Clustering.MinISR = 1
 	s1Config.Clustering.ReplicaMaxLeaderTimeout = time.Second
 	s1Config.Clustering.ReplicaMaxIdleWait = 500 * time.Millisecond
@@ -807,15 +830,6 @@ func TestTruncatePreventReplicaDivergence(t *testing.T) {
 func TestReplicatorNotifyNewData(t *testing.T) {
 	defer cleanupStorage(t)
 
-	// Use a central NATS server.
-	ns := natsdTest.RunDefaultServer()
-	defer ns.Shutdown()
-
-	// Create NATS connection.
-	nc, err := nats.GetDefaultOptions().Connect()
-	require.NoError(t, err)
-	defer nc.Close()
-
 	// Configure first server.
 	s1Config := getTestConfig("a", true, 5050)
 	s1 := runServerWithConfig(t, s1Config)
@@ -825,6 +839,11 @@ func TestReplicatorNotifyNewData(t *testing.T) {
 	s2Config := getTestConfig("b", false, 5051)
 	s2 := runServerWithConfig(t, s2Config)
 	defer s2.Stop()
+
+	// Create NATS connection.
+	nc, err := nats.GetDefaultOptions().Connect()
+	require.NoError(t, err)
+	defer nc.Close()
 
 	client, err := lift.Connect([]string{"localhost:5050", "localhost:5051"})
 	require.NoError(t, err)
@@ -883,17 +902,13 @@ func TestReplicatorNotifyNewData(t *testing.T) {
 func TestShrinkExpandISR(t *testing.T) {
 	defer cleanupStorage(t)
 
-	// Use a central NATS server.
+	// Use an external NATS server.
 	ns := natsdTest.RunDefaultServer()
 	defer ns.Shutdown()
 
-	// Create NATS connection.
-	nc, err := nats.GetDefaultOptions().Connect()
-	require.NoError(t, err)
-	defer nc.Close()
-
 	// Configure first server.
 	s1Config := getTestConfig("a", true, 5050)
+	s1Config.EmbeddedNATS = false
 	s1Config.Clustering.ReplicaMaxLagTime = time.Second
 	s1Config.Clustering.ReplicaMaxIdleWait = 2 * time.Millisecond
 	s1 := runServerWithConfig(t, s1Config)
@@ -912,6 +927,11 @@ func TestShrinkExpandISR(t *testing.T) {
 	s3Config.Clustering.ReplicaMaxIdleWait = 2 * time.Millisecond
 	s3 := runServerWithConfig(t, s3Config)
 	defer s3.Stop()
+
+	// Create NATS connection.
+	nc, err := nats.GetDefaultOptions().Connect()
+	require.NoError(t, err)
+	defer nc.Close()
 
 	getMetadataLeader(t, 10*time.Second, s1, s2, s3)
 

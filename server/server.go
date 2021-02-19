@@ -18,6 +18,7 @@ import (
 
 	"github.com/hashicorp/raft"
 	client "github.com/liftbridge-io/liftbridge-api/go"
+	gnatsd "github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nuid"
 	"github.com/pkg/errors"
@@ -47,6 +48,7 @@ type Server struct {
 	config             *Config
 	listener           net.Listener
 	port               int
+	embeddedNATS       *gnatsd.Server
 	nc                 *nats.Conn
 	ncRaft             *nats.Conn
 	ncRepl             *nats.Conn
@@ -58,6 +60,7 @@ type Server struct {
 	api                *apiServer
 	metadata           *metadataAPI
 	shutdownCh         chan struct{}
+	raftInitialized    chan struct{}
 	raft               atomic.Value
 	leaderSub          *nats.Subscription
 	recoveryStarted    bool
@@ -90,9 +93,10 @@ func New(config *Config) *Server {
 		logger.SetWriter(ioutil.Discard)
 	}
 	s := &Server{
-		config:     config,
-		logger:     logger,
-		shutdownCh: make(chan struct{}),
+		config:          config,
+		logger:          logger,
+		shutdownCh:      make(chan struct{}),
+		raftInitialized: make(chan struct{}),
 	}
 	s.metadata = newMetadataAPI(s)
 	s.activity = newActivityManager(s)
@@ -111,17 +115,6 @@ func (s *Server) Start() (err error) {
 
 	rand.Seed(time.Now().UnixNano())
 
-	// Remove server's ID from the cluster peers list if present.
-	if len(s.config.Clustering.RaftBootstrapPeers) > 0 {
-		peers := make([]string, 0, len(s.config.Clustering.RaftBootstrapPeers))
-		for _, peer := range s.config.Clustering.RaftBootstrapPeers {
-			if peer != s.config.Clustering.ServerID {
-				peers = append(peers, peer)
-			}
-		}
-		s.config.Clustering.RaftBootstrapPeers = peers
-	}
-
 	// Create the data directory if it doesn't exist.
 	if err := os.MkdirAll(s.config.DataDir, os.ModePerm); err != nil {
 		return errors.Wrap(err, "failed to create data path directories")
@@ -130,6 +123,20 @@ func (s *Server) Start() (err error) {
 	// Recover and persist metadata state.
 	if err := s.recoverAndPersistState(); err != nil {
 		return errors.Wrap(err, "failed to recover or persist metadata state")
+	}
+
+	s.logger.Infof("Liftbridge Version:        %s", Version)
+	s.logger.Infof("Server ID:                 %s", s.config.Clustering.ServerID)
+	s.logger.Infof("Namespace:                 %s", s.config.Clustering.Namespace)
+	s.logger.Infof("NATS Servers:              %s", s.config.NATSServersString())
+	s.logger.Infof("Default Retention Policy:  %s", s.config.Streams.RetentionString())
+	s.logger.Infof("Default Partition Pausing: %s", s.config.Streams.AutoPauseString())
+
+	// Start embedded NATS server if configured.
+	if s.config.EmbeddedNATS {
+		if err := s.startEmbeddedNATS(); err != nil {
+			return errors.Wrap(err, "failed to start embedded NATS server")
+		}
 	}
 
 	if err := s.createNATSConns(); err != nil {
@@ -145,12 +152,7 @@ func (s *Server) Start() (err error) {
 	s.listener = l
 	s.port = l.Addr().(*net.TCPAddr).Port
 
-	s.logger.Infof("Liftbridge Version:        %s", Version)
-	s.logger.Infof("Server ID:                 %s", s.config.Clustering.ServerID)
-	s.logger.Infof("Namespace:                 %s", s.config.Clustering.Namespace)
-	s.logger.Infof("Default Retention Policy:  %s", s.config.Streams.RetentionString())
-	s.logger.Infof("Default Partition Pausing: %s", s.config.Streams.AutoPauseString())
-	s.logger.Infof("Starting server on %s...",
+	s.logger.Infof("Starting Liftbridge server on %s...",
 		net.JoinHostPort(listenAddress.Host, strconv.Itoa(s.port)))
 
 	// Set a lower bound of one second for SegmentMaxAge to avoid frequent log
@@ -162,7 +164,8 @@ func (s *Server) Start() (err error) {
 		s.config.Streams.SegmentMaxAge = time.Second
 	}
 
-	if err := s.setupMetadataRaft(); err != nil {
+	raftNode, err := s.setupMetadataRaft()
+	if err != nil {
 		return errors.Wrap(err, "failed to start Raft node")
 	}
 
@@ -186,7 +189,7 @@ func (s *Server) Start() (err error) {
 		return errors.Wrap(err, "failed to start API server")
 	}
 
-	s.startRaftLeadershipLoop()
+	s.startRaftLeadershipLoop(raftNode)
 	return nil
 }
 
@@ -201,6 +204,14 @@ func (s *Server) Stop() error {
 	}
 
 	s.logger.Info("Shutting down...")
+
+	// Close the raftInitialized channel in case the Raft node was never
+	// initialized to prevent a deadlock.
+	select {
+	case <-s.raftInitialized:
+	default:
+		close(s.raftInitialized)
+	}
 
 	close(s.shutdownCh)
 	if s.grpcServer != nil {
@@ -226,6 +237,10 @@ func (s *Server) Stop() error {
 	}
 
 	s.closeNATSConns()
+	if s.embeddedNATS != nil {
+		s.embeddedNATS.Shutdown()
+	}
+
 	s.running = false
 	s.shutdown = true
 	s.mu.Unlock()
@@ -242,7 +257,11 @@ func (s *Server) Stop() error {
 // it's leader when it's not, the operation it proposes to the Raft cluster
 // will fail.
 func (s *Server) IsLeader() bool {
-	return s.getRaft().isLeader()
+	raft := s.getRaft()
+	if raft == nil {
+		panic("Attempted to access Raft node but it was not initialized")
+	}
+	return raft.isLeader()
 }
 
 // IsRunning indicates if the server is currently running or has been stopped.
@@ -297,6 +316,28 @@ func (s *Server) recoverAndPersistState() error {
 		panic(err)
 	}
 	return ioutil.WriteFile(file, data, 0666)
+}
+
+// startEmbeddedNATS starts a NATS server embedded in this process. It returns
+// once the server is ready to accept connections.
+func (s *Server) startEmbeddedNATS() error {
+	opts, err := gnatsd.ProcessConfigFile(s.config.EmbeddedNATSConfig)
+	if err != nil {
+		return err
+	}
+	s.embeddedNATS, err = gnatsd.NewServer(opts)
+	if err != nil {
+		return err
+	}
+	s.embeddedNATS.SetLogger(logger.NewNATSLogger(s.logger, s.config.LogNATS),
+		opts.Debug, opts.Trace)
+	s.logger.Infof("Starting embedded NATS server on %s",
+		net.JoinHostPort(opts.Host, strconv.Itoa(opts.Port)))
+	s.startGoroutine(s.embeddedNATS.Start)
+	if !s.embeddedNATS.ReadyForConnections(10 * time.Second) {
+		return errors.New("unable to start embedded NATS server")
+	}
+	return nil
 }
 
 // createNATSConns creates various NATS connections used by the server,
@@ -461,19 +502,26 @@ func (s *Server) createNATSConn(name string) (*nats.Conn, error) {
 		return nil, err
 	}
 
-	return opts.Connect()
+	var conn *nats.Conn
+	for i := 0; i < 5; i++ {
+		conn, err = opts.Connect()
+		if err == nil {
+			return conn, nil
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return nil, err
 }
 
 // startRaftLeadershipLoop start a goroutine for automatically responding to
 // Raft leadership changes.
-func (s *Server) startRaftLeadershipLoop() {
-	node := s.getRaft()
+func (s *Server) startRaftLeadershipLoop(node *raftNode) {
 	s.startGoroutine(func() {
 		for {
 			select {
 			case isLeader := <-node.notifyCh:
 				if isLeader {
-					if err := s.leadershipAcquired(); err != nil {
+					if err := s.leadershipAcquired(node); err != nil {
 						s.logger.Errorf("Error on metadata leadership acquired: %v", err)
 						switch {
 						case err == raft.ErrRaftShutdown:
@@ -492,7 +540,7 @@ func (s *Server) startRaftLeadershipLoop() {
 						}
 					}
 				} else {
-					if err := s.leadershipLost(); err != nil {
+					if err := s.leadershipLost(node); err != nil {
 						s.logger.Errorf("Error on metadata leadership lost: %v", err)
 					}
 				}
@@ -507,23 +555,27 @@ func (s *Server) startRaftLeadershipLoop() {
 // on server start.
 func (s *Server) setRaft(r *raftNode) {
 	s.raft.Store(r)
+	close(s.raftInitialized)
+	s.logger.Debug("Raft node initialized")
 }
 
 // getRaft returns the Raft node for the server.
 func (s *Server) getRaft() *raftNode {
+	<-s.raftInitialized
 	r := s.raft.Load()
 	if r == nil {
+		s.logger.Warn("Attempted to access Raft node but it was not initialized")
 		return nil
 	}
 	return r.(*raftNode)
 }
 
 // leadershipAcquired should be called when this node is elected leader.
-func (s *Server) leadershipAcquired() error {
+func (s *Server) leadershipAcquired(raft *raftNode) error {
 	s.logger.Infof("Server became metadata leader, performing leader promotion actions")
 
 	// Use a barrier to ensure all preceding operations are applied to the FSM.
-	if err := s.getRaft().Barrier(0).Error(); err != nil {
+	if err := raft.Barrier(0).Error(); err != nil {
 		return err
 	}
 
@@ -542,12 +594,12 @@ func (s *Server) leadershipAcquired() error {
 		return err
 	}
 
-	s.getRaft().setLeader(true)
+	raft.setLeader(true)
 	return nil
 }
 
 // leadershipLost should be called when this node loses leadership.
-func (s *Server) leadershipLost() error {
+func (s *Server) leadershipLost(raft *raftNode) error {
 	s.logger.Warn("Server lost metadata leadership, performing leader stepdown actions")
 
 	// Unsubscribe from leader NATS subject for propagated requests.
@@ -564,7 +616,7 @@ func (s *Server) leadershipLost() error {
 		return err
 	}
 
-	s.getRaft().setLeader(false)
+	raft.setLeader(false)
 	return nil
 }
 

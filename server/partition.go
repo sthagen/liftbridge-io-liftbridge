@@ -152,6 +152,7 @@ func (s *Server) newPartition(protoPartition *proto.Partition, recovered bool, c
 			Compact:              streamsConfig.Compact,
 			CompactMaxGoroutines: streamsConfig.CompactMaxGoroutines,
 			Logger:               s.logger,
+			ConcurrencyControl:   streamsConfig.ConcurrencyControl,
 		})
 	)
 	if err != nil {
@@ -778,6 +779,12 @@ func (p *partition) messageProcessingLoop(recvChan <-chan *nats.Msg, stop <-chan
 		batchWait = p.srv.config.BatchMaxTime
 		msgBatch  = make([]*commitlog.Message, 0, batchSize)
 	)
+	// If Concurrency Control is enabled, then the message will be appended one by one.
+	// This is to ensure no conflict between each message.
+	if p.log.IsConcurrencyControlEnabled() {
+		batchSize = 1
+	}
+
 	for {
 		msgBatch = msgBatch[:0]
 		select {
@@ -791,6 +798,11 @@ func (p *partition) messageProcessingLoop(recvChan <-chan *nats.Msg, stop <-chan
 		p.mu.Unlock()
 
 		m := natsToProtoMessage(msg, leaderEpoch)
+		// Reject messages that are larger than the max replication size.
+		if int64(len(msg.Data)) > p.srv.config.Clustering.ReplicationMaxBytes {
+			p.sendTooLargeNack(m)
+			continue
+		}
 		msgBatch = append(msgBatch, m)
 		remaining := batchSize - 1
 
@@ -814,17 +826,40 @@ func (p *partition) messageProcessingLoop(recvChan <-chan *nats.Msg, stop <-chan
 				chanLen = remaining
 			}
 
+			added := 0
 			for i := 0; i < chanLen; i++ {
 				msg = <-recvChan
 				m := natsToProtoMessage(msg, leaderEpoch)
+				if int64(len(msg.Data)) > p.srv.config.Clustering.ReplicationMaxBytes {
+					p.sendTooLargeNack(m)
+					continue
+				}
 				msgBatch = append(msgBatch, m)
+				added++
 			}
-			remaining -= chanLen
+			remaining -= added
 		}
 
 		// Write uncommitted messages to log.
 		offsets, err := p.log.Append(msgBatch)
 		if err != nil {
+
+			// AckErr should be dispatched if ErrIncorrectOffset is raised.
+			if errors.Is(err, commitlog.ErrIncorrectOffset) {
+				msg := msgBatch[0]
+				ack := &client.Ack{
+					Stream:             p.Stream,
+					PartitionSubject:   p.Subject,
+					MsgSubject:         string(msg.Headers["subject"]),
+					AckInbox:           msg.AckInbox,
+					CorrelationId:      msg.CorrelationID,
+					AckPolicy:          msg.AckPolicy,
+					ReceptionTimestamp: msg.Timestamp,
+					AckError:           client.Ack_INCORRECT_OFFSET,
+				}
+
+				p.sendAck(ack)
+			}
 			p.srv.logger.Errorf("Failed to append to log %s: %v", p, err)
 			continue
 		}
@@ -970,7 +1005,38 @@ func (p *partition) sendAck(ack *client.Ack) {
 	if err != nil {
 		panic(err)
 	}
-	p.srv.ncAcks.Publish(ack.AckInbox, data)
+	if err := p.srv.ncAcks.Publish(ack.AckInbox, data); err != nil {
+		p.srv.logger.Errorf("Error sending ack for partition %s: %v", p, err)
+	}
+}
+
+// sendTooLargeNack publishes an ack containing an error indicating the message
+// exceeded the max replication size to the specified AckInbox. If no AckInbox
+// is set, this does nothing.
+func (p *partition) sendTooLargeNack(msg *commitlog.Message) {
+	p.srv.logger.Errorf(
+		"Rejecting message received on partition %s that exceeds clustering.replication.max.bytes (%d)",
+		p, p.srv.config.Clustering.ReplicationMaxBytes)
+	if msg.AckInbox == "" {
+		return
+	}
+	ack := &client.Ack{
+		Stream:             p.Stream,
+		PartitionSubject:   p.Subject,
+		MsgSubject:         string(msg.Headers["subject"]),
+		AckInbox:           msg.AckInbox,
+		CorrelationId:      msg.CorrelationID,
+		AckPolicy:          msg.AckPolicy,
+		ReceptionTimestamp: msg.Timestamp,
+		AckError:           client.Ack_TOO_LARGE,
+	}
+	data, err := proto.MarshalAck(ack)
+	if err != nil {
+		panic(err)
+	}
+	if err := p.srv.ncAcks.Publish(ack.AckInbox, data); err != nil {
+		p.srv.logger.Errorf("Error sending ack for partition %s: %v", p, err)
+	}
 }
 
 // replicationRequestLoop is a long-running loop which sends replication
@@ -1323,7 +1389,10 @@ func (p *partition) sendPartitionNotification(replica string) {
 	if err != nil {
 		panic(err)
 	}
-	p.srv.ncRepl.Publish(p.srv.getPartitionNotificationInbox(replica), req)
+	if err := p.srv.ncRepl.Publish(p.srv.getPartitionNotificationInbox(replica), req); err != nil {
+		p.srv.logger.Errorf("Error sending new data notification to replica %s for partition %s: %v",
+			replica, p, err)
+	}
 }
 
 // pauseReplication stops replication on the leader. This is for unit testing
@@ -1373,6 +1442,7 @@ func natsToProtoMessage(msg *nats.Msg, leaderEpoch uint64) *commitlog.Message {
 		m.AckInbox = message.AckInbox
 		m.CorrelationID = message.CorrelationId
 		m.AckPolicy = message.AckPolicy
+		m.Offset = message.Offset
 	} else {
 		m.Value = msg.Data
 	}

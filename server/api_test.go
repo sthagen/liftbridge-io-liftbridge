@@ -10,14 +10,13 @@ import (
 	"time"
 
 	lift "github.com/liftbridge-io/go-liftbridge/v2"
+	proto "github.com/liftbridge-io/liftbridge-api/go"
 	natsdTest "github.com/nats-io/nats-server/v2/test"
 	"github.com/nats-io/nats.go"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-
-	proto "github.com/liftbridge-io/liftbridge-api/go"
 
 	"github.com/liftbridge-io/liftbridge/server/protocol"
 )
@@ -38,10 +37,6 @@ func assertMsg(t *testing.T, expected *message, msg *lift.Message) {
 // same stream.
 func TestCreateStream(t *testing.T) {
 	defer cleanupStorage(t)
-
-	// Use a central NATS server.
-	ns := natsdTest.RunDefaultServer()
-	defer ns.Shutdown()
 
 	// Configure server.
 	s1Config := getTestConfig("a", true, 5050)
@@ -66,10 +61,6 @@ func TestCreateStream(t *testing.T) {
 // follower, and it returns an error when creating the same stream.
 func TestCreateStreamPropagate(t *testing.T) {
 	defer cleanupStorage(t)
-
-	// Use a central NATS server.
-	ns := natsdTest.RunDefaultServer()
-	defer ns.Shutdown()
 
 	// Configure first server.
 	s1Config := getTestConfig("a", true, 0)
@@ -100,12 +91,13 @@ func TestCreateStreamPropagate(t *testing.T) {
 func TestCreateStreamNoMetadataLeader(t *testing.T) {
 	defer cleanupStorage(t)
 
-	// Use a central NATS server.
+	// Use an external NATS server.
 	ns := natsdTest.RunDefaultServer()
 	defer ns.Shutdown()
 
 	// Configure first server.
 	s1Config := getTestConfig("a", true, 0)
+	s1Config.EmbeddedNATS = false
 	s1 := runServerWithConfig(t, s1Config)
 	defer s1.Stop()
 
@@ -137,10 +129,6 @@ func TestCreateStreamNoMetadataLeader(t *testing.T) {
 func TestCreateStreamInsufficientReplicas(t *testing.T) {
 	defer cleanupStorage(t)
 
-	// Use a central NATS server.
-	ns := natsdTest.RunDefaultServer()
-	defer ns.Shutdown()
-
 	// Configure server.
 	s1Config := getTestConfig("a", true, 5050)
 	s1 := runServerWithConfig(t, s1Config)
@@ -162,10 +150,6 @@ func TestCreateStreamInsufficientReplicas(t *testing.T) {
 func TestCreateStreamPartitioned(t *testing.T) {
 	defer cleanupStorage(t)
 
-	// Use a central NATS server.
-	ns := natsdTest.RunDefaultServer()
-	defer ns.Shutdown()
-
 	// Configure server.
 	s1Config := getTestConfig("a", true, 5050)
 	s1 := runServerWithConfig(t, s1Config)
@@ -183,15 +167,19 @@ func TestCreateStreamPartitioned(t *testing.T) {
 	stream := s1.metadata.GetStream("foo")
 	require.NotNil(t, stream)
 	require.Len(t, stream.partitions, 3)
+
+	// Check partition load counts.
+	partitionCounts := s1.metadata.BrokerPartitionCounts()
+	require.Len(t, partitionCounts, 1)
+	require.Equal(t, 3, partitionCounts[s1.config.Clustering.ServerID])
+	leaderCounts := s1.metadata.BrokerLeaderCounts()
+	require.Len(t, leaderCounts, 1)
+	require.Equal(t, 3, leaderCounts[s1.config.Clustering.ServerID])
 }
 
 // Ensure subscribing to a non-existent stream returns an error.
 func TestSubscribeStreamNoSuchStream(t *testing.T) {
 	defer cleanupStorage(t)
-
-	// Use a central NATS server.
-	ns := natsdTest.RunDefaultServer()
-	defer ns.Shutdown()
 
 	// Configure server.
 	s1Config := getTestConfig("a", true, 5050)
@@ -217,10 +205,6 @@ func TestSubscribeStreamNoSuchStream(t *testing.T) {
 func TestDeleteStream(t *testing.T) {
 	defer cleanupStorage(t)
 
-	// Use a central NATS server.
-	ns := natsdTest.RunDefaultServer()
-	defer ns.Shutdown()
-
 	// Configure server.
 	s1Config := getTestConfig("a", true, 5050)
 	s1 := runServerWithConfig(t, s1Config)
@@ -244,6 +228,14 @@ func TestDeleteStream(t *testing.T) {
 	stream := s1.metadata.GetStream("foo")
 	require.NotNil(t, stream)
 
+	// Check partition load counts.
+	partitionCounts := s1.metadata.BrokerPartitionCounts()
+	require.Len(t, partitionCounts, 1)
+	require.Equal(t, 3, partitionCounts[s1.config.Clustering.ServerID])
+	leaderCounts := s1.metadata.BrokerLeaderCounts()
+	require.Len(t, leaderCounts, 1)
+	require.Equal(t, 3, leaderCounts[s1.config.Clustering.ServerID])
+
 	err = client.DeleteStream(context.Background(), "foo")
 	require.NoError(t, err)
 
@@ -253,6 +245,14 @@ func TestDeleteStream(t *testing.T) {
 	stream = s1.metadata.GetStream("foo")
 	require.Nil(t, stream)
 
+	// Check partition load counts.
+	partitionCounts = s1.metadata.BrokerPartitionCounts()
+	require.Len(t, partitionCounts, 1)
+	require.Equal(t, 0, partitionCounts[s1.config.Clustering.ServerID])
+	leaderCounts = s1.metadata.BrokerLeaderCounts()
+	require.Len(t, leaderCounts, 1)
+	require.Equal(t, 0, leaderCounts[s1.config.Clustering.ServerID])
+
 	err = client.CreateStream(context.Background(), "foo", "foo", lift.Partitions(3))
 	require.NoError(t, err)
 }
@@ -261,10 +261,6 @@ func TestDeleteStream(t *testing.T) {
 // follower.
 func TestDeleteStreamPropagate(t *testing.T) {
 	defer cleanupStorage(t)
-
-	// Use a central NATS server.
-	ns := natsdTest.RunDefaultServer()
-	defer ns.Shutdown()
 
 	// Configure first server.
 	s1Config := getTestConfig("a", true, 0)
@@ -294,10 +290,6 @@ func TestDeleteStreamPropagate(t *testing.T) {
 // with an explication opt-in to requestion from a random ISR replica
 func TestSubscribeStreamNotLeader(t *testing.T) {
 	defer cleanupStorage(t)
-
-	// Use a central NATS server.
-	ns := natsdTest.RunDefaultServer()
-	defer ns.Shutdown()
 
 	// Configure first server.
 	s1Config := getTestConfig("a", true, 5050)
@@ -353,10 +345,6 @@ func TestSubscribeStreamNotLeader(t *testing.T) {
 // returns an error. By default, do not take subscription to stream's replica.
 func TestSubscribeStreamNotLeaderDefaultBehavior(t *testing.T) {
 	defer cleanupStorage(t)
-
-	// Use a central NATS server.
-	ns := natsdTest.RunDefaultServer()
-	defer ns.Shutdown()
 
 	// Configure first server.
 	s1Config := getTestConfig("a", true, 5050)
@@ -414,14 +402,11 @@ func TestSubscribeStreamNotLeaderDefaultBehavior(t *testing.T) {
 func TestStreamReceiveMsgFromReplica(t *testing.T) {
 	defer cleanupStorage(t)
 
-	// Use a central NATS server.
-	ns := natsdTest.RunDefaultServer()
-	defer ns.Shutdown()
-
 	// Configure server.
 	s1Config := getTestConfig("a", true, 5050)
 	s1 := runServerWithConfig(t, s1Config)
 	defer s1.Stop()
+
 	// Configure second server.
 	s2Config := getTestConfig("b", false, 5051)
 	s2 := runServerWithConfig(t, s2Config)
@@ -543,12 +528,9 @@ func TestStreamReceiveMsgFromReplica(t *testing.T) {
 func TestStreamPublishSubscribe(t *testing.T) {
 	defer cleanupStorage(t)
 
-	// Use a central NATS server.
-	ns := natsdTest.RunDefaultServer()
-	defer ns.Shutdown()
-
 	// Configure server.
 	s1Config := getTestConfig("a", true, 5050)
+	s1Config.Clustering.ReplicationMaxBytes = 1024
 	s1 := runServerWithConfig(t, s1Config)
 	defer s1.Stop()
 
@@ -647,18 +629,22 @@ func TestStreamPublishSubscribe(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("Did not receive all expected messages")
 	}
+
+	// Publishing a message whose size is larger than max replication size
+	// returns an error.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err = client.Publish(ctx, name, make([]byte, 1024+1))
+	require.Error(t, err)
 }
 
 // Ensure legacy Publish endpoint works.
 func TestLegacyPublish(t *testing.T) {
 	defer cleanupStorage(t)
 
-	// Use a central NATS server.
-	ns := natsdTest.RunDefaultServer()
-	defer ns.Shutdown()
-
 	// Configure server.
 	s1Config := getTestConfig("a", true, 5050)
+	s1Config.Clustering.ReplicationMaxBytes = 1024
 	s1 := runServerWithConfig(t, s1Config)
 	defer s1.Stop()
 
@@ -708,15 +694,22 @@ func TestLegacyPublish(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Nil(t, resp.Ack)
+
+	// Publishing a message whose size is larger than max replication size
+	// returns an error.
+	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err = apiClient.Publish(ctx, &proto.PublishRequest{
+		Stream:    "foo",
+		Partition: 1,
+		Value:     make([]byte, 1024+1),
+	})
+	require.Error(t, err)
 }
 
 // Ensure publishing to a NATS subject works.
 func TestPublishToSubject(t *testing.T) {
 	defer cleanupStorage(t)
-
-	// Use a central NATS server.
-	ns := natsdTest.RunDefaultServer()
-	defer ns.Shutdown()
 
 	// Configure server.
 	s1Config := getTestConfig("a", true, 5050)
@@ -807,7 +800,8 @@ func TestSubscribePartitionPaused(t *testing.T) {
 	_, statusCh, status := api.subscribe(context.Background(), stream.GetPartitions()[0], req, make(chan struct{}))
 	require.Nil(t, status)
 
-	require.NoError(t, stream.Pause(nil, true))
+	_, err = stream.Pause(nil, true)
+	require.NoError(t, err)
 
 	select {
 	case status := <-statusCh:
@@ -852,10 +846,6 @@ func TestSubscribePartitionClosed(t *testing.T) {
 
 func TestSubscribeStopPosition(t *testing.T) {
 	defer cleanupStorage(t)
-
-	// Use a central NATS server.
-	ns := natsdTest.RunDefaultServer()
-	defer ns.Shutdown()
 
 	// Configure server.
 	s1Config := getTestConfig("a", true, 5050)
@@ -985,10 +975,6 @@ func TestGetStreamConfig(t *testing.T) {
 func TestSetFetchCursor(t *testing.T) {
 	defer cleanupStorage(t)
 
-	// Use a central NATS server.
-	ns := natsdTest.RunDefaultServer()
-	defer ns.Shutdown()
-
 	// Configure server.
 	s1Config := getTestConfig("a", true, 5050)
 	s1Config.CursorsStream.Partitions = 5
@@ -1042,10 +1028,6 @@ func TestSetFetchCursor(t *testing.T) {
 // cache is empty.
 func TestSetFetchCursorNoCache(t *testing.T) {
 	defer cleanupStorage(t)
-
-	// Use a central NATS server.
-	ns := natsdTest.RunDefaultServer()
-	defer ns.Shutdown()
 
 	// Configure server.
 	s1Config := getTestConfig("a", true, 5050)
@@ -1124,10 +1106,6 @@ func publishAndReceive(t *testing.T, client lift.Client, stream string) {
 func TestFetchPartitionMetadataMessagesReceivedTimestamps(t *testing.T) {
 	defer cleanupStorage(t)
 
-	// Use a central NATS server.
-	ns := natsdTest.RunDefaultServer()
-	defer ns.Shutdown()
-
 	// Configure server.
 	s1Config := getTestConfig("a", true, 5050)
 	s1 := runServerWithConfig(t, s1Config)
@@ -1179,10 +1157,6 @@ func TestFetchPartitionMetadataMessagesReceivedTimestamps(t *testing.T) {
 // with coherent values.
 func TestFetchPartitionMetadataPauseTimestamps(t *testing.T) {
 	defer cleanupStorage(t)
-
-	// Use a central NATS server.
-	ns := natsdTest.RunDefaultServer()
-	defer ns.Shutdown()
 
 	// Configure server.
 	s1Config := getTestConfig("a", true, 5050)
@@ -1236,10 +1210,6 @@ func TestFetchPartitionMetadataPauseTimestamps(t *testing.T) {
 func TestFetchPartitionMetadataReadonlyTimestamps(t *testing.T) {
 	defer cleanupStorage(t)
 
-	// Use a central NATS server.
-	ns := natsdTest.RunDefaultServer()
-	defer ns.Shutdown()
-
 	// Configure server.
 	s1Config := getTestConfig("a", true, 5050)
 	s1 := runServerWithConfig(t, s1Config)
@@ -1287,4 +1257,494 @@ func TestFetchPartitionMetadataReadonlyTimestamps(t *testing.T) {
 	// the latest timestamp has been updated.
 	require.Equal(t, firstReadonlyTimestamp, metadata.ReadonlyTimestamps().FirstTime())
 	require.True(t, metadata.ReadonlyTimestamps().LatestTime().After(firstReadonlyTimestamp))
+}
+
+// TestPublishAsync ensures async publish with AckHandler is able to handle async error.
+func TestPublishAsync(t *testing.T) {
+	defer cleanupStorage(t)
+
+	// Use a central NATS server.
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	// Configure server.
+	s1Config := getTestConfig("a", true, 5050)
+	s1Config.EmbeddedNATS = false
+	s1 := runServerWithConfig(t, s1Config)
+	defer s1.Stop()
+
+	getMetadataLeader(t, 10*time.Second, s1)
+
+	client, err := lift.Connect([]string{"localhost:5050"})
+	require.NoError(t, err)
+	defer client.Close()
+	stream := "foo"
+
+	err = client.CreateStream(context.Background(), "foo", stream)
+	require.NoError(t, err)
+
+	// channel for async error handler
+	errorC := make(chan error)
+
+	// Publish Async
+	err = client.PublishAsync(context.Background(), "foo", []byte("hello"),
+		func(ack *lift.Ack, err error) {
+			errorC <- err
+		},
+		lift.AckPolicyLeader())
+	require.NoError(t, err)
+
+	select {
+	case err := <-errorC:
+		// should be no error
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("Did not receive expected error")
+	}
+}
+
+// TestPublishAsyncWithConcurrencyNoAckPolicy ensures an error is trigger in case of concurrent publishes
+// and no AckPolicy is set
+func TestPublishAsyncWithConcurrencyNoAckPolicy(t *testing.T) {
+	defer cleanupStorage(t)
+
+	// Use a central NATS server.
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	// Configure server.
+	s1Config := getTestConfig("a", true, 5050)
+	s1Config.EmbeddedNATS = false
+	s1 := runServerWithConfig(t, s1Config)
+	defer s1.Stop()
+
+	getMetadataLeader(t, 10*time.Second, s1)
+
+	client, err := lift.Connect([]string{"localhost:5050"})
+	require.NoError(t, err)
+	defer client.Close()
+	stream := "foo"
+
+	// Create a stream and enable Optimistic Concurrency Control
+	err = client.CreateStream(context.Background(), "foo", stream, lift.OptimisticConcurrencyControl(true))
+	require.NoError(t, err)
+
+	// channel for async error handler
+	errorC := make(chan error)
+
+	// Publish Async with expected offset
+	err = client.PublishAsync(context.Background(), "foo", []byte("hello"),
+		func(ack *lift.Ack, err error) {
+			errorC <- err
+		},
+		// Set AckPolicy to NONE
+		lift.AckPolicyNone(),
+		// expected offset
+		lift.ExpectedOffset(0),
+	)
+	require.NoError(t, err)
+
+	select {
+	case err := <-errorC:
+		require.Error(t, err)
+		st := status.Convert(err)
+		// Expect error
+		require.Equal(t, "stream with concurrency control must have AckPolicy set", st.Message())
+	case <-time.After(time.Second):
+		t.Fatal("Did not receive expected error")
+	}
+}
+
+// TestPublishAsyncWithConcurrencyErrorWrongOffset ensures an error is trigger in case of concurrent publishes.
+func TestPublishAsyncWithConcurrencyErrorWrongOffset(t *testing.T) {
+	defer cleanupStorage(t)
+
+	// Use a central NATS server.
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	// Configure server.
+	s1Config := getTestConfig("a", true, 5050)
+	s1Config.EmbeddedNATS = false
+	s1 := runServerWithConfig(t, s1Config)
+	defer s1.Stop()
+
+	getMetadataLeader(t, 10*time.Second, s1)
+
+	client, err := lift.Connect([]string{"localhost:5050"})
+	require.NoError(t, err)
+	defer client.Close()
+	stream := "foo"
+
+	// Create a stream and enable Optimistic Concurrency Control
+	err = client.CreateStream(context.Background(), "foo", stream, lift.OptimisticConcurrencyControl(true))
+	require.NoError(t, err)
+
+	// channel for async error handler
+	errorC := make(chan error)
+
+	// Publish Async with expected offset
+	err = client.PublishAsync(context.Background(), "foo", []byte("hello"),
+		func(ack *lift.Ack, err error) {
+			errorC <- err
+		},
+		lift.AckPolicyLeader(),
+		// Wrong offset
+		lift.ExpectedOffset(100),
+	)
+	require.NoError(t, err)
+
+	select {
+	case err := <-errorC:
+		require.Error(t, err)
+		st := status.Convert(err)
+		// Expect error
+		require.Equal(t, "incorrect expected offset", st.Message())
+	case <-time.After(time.Second):
+		t.Fatal("Did not receive expected error")
+	}
+}
+
+// TestPublishAsyncWithConcurrencyIgnoreOffset ensures that the server will ignore concurrency control
+// for request that has expected offset -1.
+func TestPublishAsyncWithConcurrencyIgnoreOffset(t *testing.T) {
+	defer cleanupStorage(t)
+
+	// Use a central NATS server.
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	// Configure server.
+	s1Config := getTestConfig("a", true, 5050)
+	s1Config.EmbeddedNATS = false
+	s1 := runServerWithConfig(t, s1Config)
+	defer s1.Stop()
+
+	getMetadataLeader(t, 10*time.Second, s1)
+
+	client, err := lift.Connect([]string{"localhost:5050"})
+	require.NoError(t, err)
+	defer client.Close()
+	stream := "foo"
+
+	// Create a stream and enable Optimistic Concurrency Control
+	err = client.CreateStream(context.Background(), "foo", stream, lift.OptimisticConcurrencyControl(true))
+	require.NoError(t, err)
+
+	// channel for async error handler
+	errorC := make(chan error)
+
+	// Publish Async with expected offset
+	err = client.PublishAsync(context.Background(), "foo", []byte("hello"),
+		func(ack *lift.Ack, err error) {
+			errorC <- err
+		},
+		lift.AckPolicyLeader(),
+		// expected offset -1 to indicate next offset
+		lift.ExpectedOffset(-1),
+	)
+	require.NoError(t, err)
+
+	select {
+	case err := <-errorC:
+		// should be no error
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("Did not receive expected error")
+	}
+}
+
+// TestPublishAsyncWithConcurrencyCorrectOffset ensures that published messages
+// work with correct expected offset provided.
+func TestPublishAsyncWithConcurrencyCorrectOffset(t *testing.T) {
+	defer cleanupStorage(t)
+
+	// Use a central NATS server.
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	// Configure server.
+	s1Config := getTestConfig("a", true, 5050)
+	s1Config.EmbeddedNATS = false
+	s1 := runServerWithConfig(t, s1Config)
+	defer s1.Stop()
+
+	getMetadataLeader(t, 10*time.Second, s1)
+
+	client, err := lift.Connect([]string{"localhost:5050"})
+	require.NoError(t, err)
+	defer client.Close()
+	stream := "foo"
+
+	// Create a stream and enable Optimistic Concurrency Control
+	err = client.CreateStream(context.Background(), "foo", stream, lift.OptimisticConcurrencyControl(true))
+	require.NoError(t, err)
+
+	// channel for async error handler
+	errorC := make(chan error)
+
+	// Publish Async with expected offset
+	err = client.PublishAsync(context.Background(), "foo", []byte("hello"),
+		func(ack *lift.Ack, err error) {
+			errorC <- err
+		},
+		lift.AckPolicyLeader(),
+		// Correct offset is 0 (first message)
+		lift.ExpectedOffset(0),
+	)
+	require.NoError(t, err)
+
+	select {
+	case err := <-errorC:
+		// should be no error
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("Did not receive expected error")
+	}
+
+	// Publish Async with incorrect expected offset
+	err = client.PublishAsync(context.Background(), "foo", []byte("hello"),
+		func(ack *lift.Ack, err error) {
+			errorC <- err
+		},
+		lift.AckPolicyLeader(),
+		// Correct offset is 1 (second message)
+		lift.ExpectedOffset(0),
+	)
+	require.NoError(t, err)
+
+	select {
+	case err := <-errorC:
+		require.Error(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("Did not receive expected error")
+	}
+}
+
+// TestMultiplePublishAsyncWithConcurrency ensures that in the scenario
+// where multiple publishes are epxected, the concurrency control should raise error
+// on conflicts
+func TestMultiplePublishAsyncWithConcurrency(t *testing.T) {
+	defer cleanupStorage(t)
+
+	// Use a central NATS server.
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	// Configure server.
+	s1Config := getTestConfig("a", true, 5050)
+	s1Config.EmbeddedNATS = false
+	s1 := runServerWithConfig(t, s1Config)
+	defer s1.Stop()
+
+	getMetadataLeader(t, 10*time.Second, s1)
+
+	// Client 1
+	client1, err := lift.Connect([]string{"localhost:5050"})
+	require.NoError(t, err)
+	defer client1.Close()
+
+	client2, err := lift.Connect([]string{"localhost:5050"})
+	require.NoError(t, err)
+	defer client2.Close()
+
+	stream := "foo"
+
+	// Create a stream and enable Optimistic Concurrency Control
+	err = client1.CreateStream(context.Background(), "foo", stream, lift.OptimisticConcurrencyControl(true))
+	require.NoError(t, err)
+
+	// channel for async error handler
+	errorC := make(chan error)
+
+	// Client 1 publish first
+	err = client1.PublishAsync(context.Background(), "foo", []byte("hello"),
+		func(ack *lift.Ack, err error) {
+			errorC <- err
+		},
+		lift.AckPolicyLeader(),
+		// expected offset is 0 for cilent 1
+		lift.ExpectedOffset(0),
+	)
+	require.NoError(t, err)
+
+	select {
+	case err := <-errorC:
+		// should be no error for client 1
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("Did not receive expected error")
+	}
+
+	// Client 2 publish late
+	err = client2.PublishAsync(context.Background(), "foo", []byte("hello"),
+		func(ack *lift.Ack, err error) {
+			errorC <- err
+		},
+		lift.AckPolicyLeader(),
+		// expected offset is 0 for the client 2
+		lift.ExpectedOffset(0),
+	)
+	require.NoError(t, err)
+
+	select {
+	case err := <-errorC:
+		// should have concurrency error for client 2
+		require.Error(t, err)
+		st := status.Convert(err)
+		// Expect error
+		require.Equal(t, "incorrect expected offset", st.Message())
+	case <-time.After(time.Second):
+		t.Fatal("Did not receive expected error")
+	}
+
+	// Client 2 publish again with correct offset
+	err = client1.PublishAsync(context.Background(), "foo", []byte("hello"),
+		func(ack *lift.Ack, err error) {
+			errorC <- err
+		},
+		lift.AckPolicyLeader(),
+		// expected offset is 1 for cilent 2
+		lift.ExpectedOffset(1),
+	)
+	require.NoError(t, err)
+
+	select {
+	case err := <-errorC:
+		// should be no error for client 2
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("Did not receive expected error")
+	}
+}
+
+// TestMultiplePublishAsyncWithConcurrencyRetryWithFetchMetadata ensures that in the scenario
+// where multiple publishes are epxected, the concurrency control should raise error
+// on conflicts. Client may try to fetch latest message offset using FetchPartitionMetadata endpoint and retry
+// publishing
+func TestMultiplePublishAsyncWithConcurrencyRetryWithFetchMetadata(t *testing.T) {
+	defer cleanupStorage(t)
+
+	// Use a central NATS server.
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	// Configure server.
+	s1Config := getTestConfig("a", true, 5050)
+	s1Config.EmbeddedNATS = false
+	s1 := runServerWithConfig(t, s1Config)
+	defer s1.Stop()
+
+	getMetadataLeader(t, 10*time.Second, s1)
+
+	// Client 1
+	client1, err := lift.Connect([]string{"localhost:5050"})
+	require.NoError(t, err)
+	defer client1.Close()
+
+	client2, err := lift.Connect([]string{"localhost:5050"})
+	require.NoError(t, err)
+	defer client2.Close()
+
+	stream := "foo"
+
+	// Create a stream and enable Optimistic Concurrency Control
+	err = client1.CreateStream(context.Background(), "foo", stream, lift.OptimisticConcurrencyControl(true))
+	require.NoError(t, err)
+
+	// channel for async error handler
+	errorC := make(chan error)
+
+	// Client 1 publish first
+	err = client1.PublishAsync(context.Background(), "foo", []byte("hello"),
+		func(ack *lift.Ack, err error) {
+			errorC <- err
+		},
+		lift.AckPolicyLeader(),
+		// expected offset is 0 for cilent 1
+		lift.ExpectedOffset(0),
+	)
+	require.NoError(t, err)
+
+	select {
+	case err := <-errorC:
+		// should be no error for client 1
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("Did not receive expected error")
+	}
+
+	// Client 2 publish late
+	err = client2.PublishAsync(context.Background(), "foo", []byte("hello"),
+		func(ack *lift.Ack, err error) {
+			errorC <- err
+		},
+		lift.AckPolicyLeader(),
+		// expected offset is 0 for the client 2
+		lift.ExpectedOffset(0),
+	)
+	require.NoError(t, err)
+
+	select {
+	case err := <-errorC:
+		// should have concurrency error for client 2
+		require.Error(t, err)
+		st := status.Convert(err)
+		// Expect error
+		require.Equal(t, "incorrect expected offset", st.Message())
+	case <-time.After(time.Second):
+		t.Fatal("Did not receive expected error")
+	}
+
+	// Client 2 fetches metadata to know what position available
+	metadata, err := client2.FetchPartitionMetadata(context.Background(), stream, 0)
+	require.NoError(t, err)
+
+	latestOffet := metadata.NewestOffset()
+	// In this scenario, only one message is published, so the expected offset should be 1
+	expectedOffset := latestOffet + 1
+
+	// Client 2 publish again with correct offset
+	err = client1.PublishAsync(context.Background(), "foo", []byte("hello"),
+		func(ack *lift.Ack, err error) {
+			errorC <- err
+		},
+		lift.AckPolicyLeader(),
+		lift.ExpectedOffset(expectedOffset),
+	)
+	require.NoError(t, err)
+
+	select {
+	case err := <-errorC:
+		// should be no error for client 2
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("Did not receive expected error")
+	}
+
+	// A client 3 that publishes with incorrect expected offset
+	client3, err := lift.Connect([]string{"localhost:5050"})
+	require.NoError(t, err)
+	defer client3.Close()
+
+	err = client3.PublishAsync(context.Background(), "foo", []byte("hello"),
+		func(ack *lift.Ack, err error) {
+			errorC <- err
+		},
+		lift.AckPolicyLeader(),
+		lift.ExpectedOffset(100),
+	)
+	require.NoError(t, err)
+
+	select {
+	case err := <-errorC:
+		// should have concurrency error for client 3
+		require.Error(t, err)
+		st := status.Convert(err)
+		// Expect error
+		require.Equal(t, "incorrect expected offset", st.Message())
+	case <-time.After(time.Second):
+		t.Fatal("Did not receive expected error")
+	}
+
 }

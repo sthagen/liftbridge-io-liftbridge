@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -198,12 +199,11 @@ func (r *raftLogger) Close() error { return nil }
 // seed node, or bootstrap using a predefined cluster configuration. If joining
 // an existing cluster, this will attempt to join for up to 30 seconds before
 // giving up and returning an error.
-func (s *Server) setupMetadataRaft() error {
-	existingState, err := s.createRaftNode()
+func (s *Server) setupMetadataRaft() (*raftNode, error) {
+	node, existingState, err := s.createRaftNode()
 	if err != nil {
-		return err
+		return nil, err
 	}
-	node := s.getRaft()
 
 	// Bootstrap if there is no previous state and we are starting this node as
 	// a seed or a cluster configuration is provided.
@@ -212,7 +212,7 @@ func (s *Server) setupMetadataRaft() error {
 	if bootstrap {
 		if err := s.bootstrapCluster(node.Raft); err != nil {
 			node.shutdown()
-			return err
+			return nil, err
 		}
 		s.logger.Debug("Successfully bootstrapped metadata Raft group")
 	} else if !existingState {
@@ -250,7 +250,7 @@ func (s *Server) setupMetadataRaft() error {
 			s.logger.Debug("Successfully joined metadata Raft group")
 		} else {
 			node.shutdown()
-			return errors.New("failed to join metadata Raft group")
+			return nil, errors.New("failed to join metadata Raft group")
 		}
 	}
 	if s.config.Clustering.RaftBootstrapSeed {
@@ -260,7 +260,7 @@ func (s *Server) setupMetadataRaft() error {
 		s.startGoroutine(s.detectBootstrapMisconfig)
 	}
 
-	return nil
+	return node, nil
 }
 
 // bootstrapCluster bootstraps the node for the provided Raft group either as a
@@ -276,6 +276,10 @@ func (s *Server) bootstrapCluster(node *raft.Raft) error {
 		// Bootstrap using provided cluster configuration.
 		s.logger.Debug("Bootstrapping metadata Raft group using provided configuration")
 		for _, peer := range s.config.Clustering.RaftBootstrapPeers {
+			if peer == s.config.Clustering.ServerID {
+				// Don't add ourselves twice.
+				continue
+			}
 			servers = append(servers, raft.Server{
 				ID:      raft.ServerID(peer),
 				Address: raft.ServerAddress(peer), // NATS transport uses ID as addr.
@@ -285,6 +289,21 @@ func (s *Server) bootstrapCluster(node *raft.Raft) error {
 		// Bootstrap as a seed node.
 		s.logger.Debug("Bootstrapping metadata Raft group as seed node")
 	}
+
+	// Enforce quorum size limit. Any servers beyond the limit are non-voters.
+	maxQuorum := s.config.Clustering.RaftMaxQuorumSize
+	if maxQuorum == 0 || maxQuorum > uint(len(servers)) {
+		maxQuorum = uint(len(servers))
+	}
+	sort.SliceStable(servers, func(i, j int) bool { return servers[i].ID < servers[j].ID })
+	for i, server := range servers[maxQuorum:] {
+		servers[i+int(maxQuorum)] = raft.Server{
+			ID:       server.ID,
+			Address:  server.Address,
+			Suffrage: raft.Nonvoter,
+		}
+	}
+
 	config := raft.Configuration{Servers: servers}
 	return node.BootstrapCluster(config).Error()
 }
@@ -319,7 +338,9 @@ func (s *Server) detectBootstrapMisconfig() {
 		case <-s.shutdownCh:
 			return
 		case <-ticker.C:
-			s.ncRaft.PublishRequest(subj, inbox, srvID)
+			if err := s.ncRaft.PublishRequest(subj, inbox, srvID); err != nil {
+				s.logger.Errorf("Error publishing bootstrap misconfiguration detection message: %v", err)
+			}
 		}
 	}
 }
@@ -327,7 +348,7 @@ func (s *Server) detectBootstrapMisconfig() {
 // createRaftNode creates and starts an embedded Raft node for replicating
 // cluster metadata. It returns a bool indicating if the Raft node had existing
 // state that was loaded.
-func (s *Server) createRaftNode() (bool, error) {
+func (s *Server) createRaftNode() (*raftNode, bool, error) {
 	path := filepath.Join(s.config.DataDir, "raft")
 
 	// Configure Raft.
@@ -347,27 +368,27 @@ func (s *Server) createRaftNode() (bool, error) {
 	tr, err := natslog.NewNATSTransport(s.config.Clustering.ServerID, s.baseMetadataRaftSubject()+".",
 		s.ncRaft, 2*time.Second, logWriter)
 	if err != nil {
-		return false, err
+		return nil, false, err
 	}
 
 	// Create the snapshot store. This allows Raft to truncate the log.
 	snapshots, err := raft.NewFileSnapshotStore(path, s.config.Clustering.RaftSnapshots, logWriter)
 	if err != nil {
 		tr.Close()
-		return false, fmt.Errorf("file snapshot store: %s", err)
+		return nil, false, fmt.Errorf("file snapshot store: %s", err)
 	}
 
 	// Create the log store and cache.
 	logStore, err := raftboltdb.NewBoltStore(filepath.Join(path, "raft.db"))
 	if err != nil {
 		tr.Close()
-		return false, fmt.Errorf("new bolt store: %s", err)
+		return nil, false, fmt.Errorf("new bolt store: %s", err)
 	}
 	cacheStore, err := raft.NewLogCache(s.config.Clustering.RaftCacheSize, logStore)
 	if err != nil {
 		tr.Close()
 		logStore.Close()
-		return false, err
+		return nil, false, err
 	}
 
 	// Instantiate the Raft node.
@@ -375,7 +396,7 @@ func (s *Server) createRaftNode() (bool, error) {
 	if err != nil {
 		tr.Close()
 		logStore.Close()
-		return false, fmt.Errorf("new raft: %s", err)
+		return nil, false, fmt.Errorf("new raft: %s", err)
 	}
 
 	// Check if there is existing state.
@@ -384,7 +405,7 @@ func (s *Server) createRaftNode() (bool, error) {
 		node.Shutdown()
 		tr.Close()
 		logStore.Close()
-		return false, err
+		return nil, false, err
 	}
 
 	if existingState {
@@ -393,7 +414,31 @@ func (s *Server) createRaftNode() (bool, error) {
 
 	// Handle requests to join the cluster.
 	subj := fmt.Sprintf("%s.join", s.baseMetadataRaftSubject())
-	sub, err := s.ncRaft.Subscribe(subj, func(msg *nats.Msg) {
+	sub, err := s.ncRaft.Subscribe(subj, s.newClusterJoinRequestHandler(node))
+	if err != nil {
+		node.Shutdown()
+		tr.Close()
+		logStore.Close()
+		return nil, false, err
+	}
+
+	raftNode := &raftNode{
+		Raft:      node,
+		store:     logStore,
+		transport: tr,
+		logInput:  logWriter,
+		notifyCh:  raftNotifyCh,
+		joinSub:   sub,
+	}
+	s.setRaft(raftNode)
+
+	return raftNode, existingState, nil
+}
+
+// newClusterJoinRequestHandler creates a NATS handler for handling requests
+// to join the Raft cluster.
+func (s *Server) newClusterJoinRequestHandler(node *raft.Raft) func(*nats.Msg) {
+	return func(msg *nats.Msg) {
 		// Drop the request if we're not the leader. There's no race condition
 		// after this check because even if we proceed with the cluster add, it
 		// will fail if the node is not the leader as cluster changes go
@@ -407,16 +452,43 @@ func (s *Server) createRaftNode() (bool, error) {
 			return
 		}
 
-		// Add the node as a voter. This is idempotent. No-op if the request
-		// came from ourselves.
 		resp := &proto.RaftJoinResponse{}
-		if req.NodeID != s.config.Clustering.ServerID {
-			future := node.AddVoter(
-				raft.ServerID(req.NodeID),
-				raft.ServerAddress(req.NodeAddr), 0, 0)
+
+		// No-op if the request came from ourselves.
+		if req.NodeID == s.config.Clustering.ServerID {
+			r, err := proto.MarshalRaftJoinResponse(resp)
+			if err != nil {
+				panic(err)
+			}
+			msg.Respond(r)
+			return
+		}
+
+		// Add the node to the cluster with appropriate suffrage. This is
+		// idempotent.
+		isVoter, err := s.addAsVoter(node)
+		if err != nil {
+			resp.Error = err.Error()
+		} else {
+			var future raft.IndexFuture
+			if isVoter {
+				s.logger.Debugf("Adding server %s to metadata Raft group as voter", req.NodeID)
+				future = node.AddVoter(
+					raft.ServerID(req.NodeID),
+					raft.ServerAddress(req.NodeAddr), 0, 0)
+			} else {
+				s.logger.Debugf("Adding server %s to metadata Raft group as non-voter", req.NodeID)
+				future = node.AddNonvoter(
+					raft.ServerID(req.NodeID),
+					raft.ServerAddress(req.NodeAddr), 0, 0)
+			}
 			if err := future.Error(); err != nil {
 				resp.Error = err.Error()
 			}
+		}
+
+		if resp.Error != "" {
+			s.logger.Errorf("Failed to add server %s to metadata Raft group: %s", req.NodeID, resp.Error)
 		}
 
 		// Send the response.
@@ -425,24 +497,31 @@ func (s *Server) createRaftNode() (bool, error) {
 			panic(err)
 		}
 		msg.Respond(r)
-	})
-	if err != nil {
-		node.Shutdown()
-		tr.Close()
-		logStore.Close()
+	}
+}
+
+// addAsVoter returns a bool indicating if a new node to be added to the
+// cluster should be added as a voter or not based on current configuration. If
+// we are below the max quorum size or there is no quorum limit, the new node
+// will be added as a voter.  Otherwise, it's added as a non-voter.
+func (s *Server) addAsVoter(node *raft.Raft) (bool, error) {
+	maxQuorum := s.config.Clustering.RaftMaxQuorumSize
+	if maxQuorum == 0 {
+		return true, nil
+	}
+	// If there is a quorum limit, count the number of voting members.
+	future := node.GetConfiguration()
+	if err := future.Error(); err != nil {
 		return false, err
 	}
+	voters := uint(0)
+	for _, server := range future.Configuration().Servers {
+		if server.Suffrage == raft.Voter || server.Suffrage == raft.Staging {
+			voters++
+		}
+	}
 
-	s.setRaft(&raftNode{
-		Raft:      node,
-		store:     logStore,
-		transport: tr,
-		logInput:  logWriter,
-		notifyCh:  raftNotifyCh,
-		joinSub:   sub,
-	})
-
-	return existingState, nil
+	return voters < maxQuorum, nil
 }
 
 // baseMetadataRaftSubject returns the base NATS subject used for Raft-related

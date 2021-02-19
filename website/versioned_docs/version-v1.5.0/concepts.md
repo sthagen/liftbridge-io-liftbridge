@@ -1,6 +1,7 @@
 ---
-id: concepts
+id: version-v1.5.0-concepts
 title: Concepts
+original_id: concepts
 ---
 
 Liftbridge is a durable stream augmentation for NATS, so it's important to
