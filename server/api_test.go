@@ -1046,6 +1046,41 @@ func TestSetFetchCursor(t *testing.T) {
 	require.Error(t, err)
 }
 
+// Ensure FetchCursor returns -1 if the cursors partition becomes empty after
+// cursors were committed (due to retention).
+func TestFetchCursorEmpty(t *testing.T) {
+	defer cleanupStorage(t)
+
+	// Configure server.
+	s1Config := getTestConfig("a", true, 5050)
+	s1Config.CursorsStream.Partitions = 1
+	s1 := runServerWithConfig(t, s1Config)
+	defer s1.Stop()
+
+	getMetadataLeader(t, 10*time.Second, s1)
+
+	client, err := lift.Connect([]string{"localhost:5050"})
+	require.NoError(t, err)
+	defer client.Close()
+
+	stream := "foo"
+	partition := int32(0)
+	cursorID := "abc"
+
+	err = client.CreateStream(context.Background(), "foo", stream)
+	require.NoError(t, err)
+
+	// Override cursors HW to simulate cursors being committed and then the
+	// partition subsequently being cleaned due to retention rules.
+	cursorsPartition := s1.metadata.GetPartition(cursorsStream, 0)
+	cursorsPartition.log.OverrideHighWatermark(10)
+
+	// FetchCursor should return -1 since the cursors partition is empty.
+	offset, err := client.FetchCursor(context.Background(), cursorID, stream, partition)
+	require.NoError(t, err)
+	require.Equal(t, int64(-1), offset)
+}
+
 // Ensure SetCursor stores cursors and FetchCursor retrieves them even if the
 // cache is empty.
 func TestSetFetchCursorNoCache(t *testing.T) {
@@ -2076,4 +2111,42 @@ func TestDataEncryptionStreamOnError(t *testing.T) {
 	st := status.Convert(err)
 	require.Contains(t, st.Message(), "invalid AES key size")
 
+}
+
+// TestFetchMetadata ensures metadata from the cluster can be made available to
+// clients.
+func TestFetchMetadata(t *testing.T) {
+	defer cleanupStorage(t)
+
+	// Configure server.
+	s1Config := getTestConfig("a", true, 5050)
+	// Set up  metadata cache to expire instantly
+	s1Config.MetadataCacheMaxAge = 1 * time.Nanosecond
+	s1 := runServerWithConfig(t, s1Config)
+	defer s1.Stop()
+
+	getMetadataLeader(t, 10*time.Second, s1)
+
+	client, err := lift.Connect([]string{"localhost:5050"})
+	require.NoError(t, err)
+	defer client.Close()
+
+	// Create a stream with 5 partitions
+	err = client.CreateStream(context.Background(), "foo", "foo", lift.Partitions(5))
+	require.NoError(t, err)
+
+	resp, err := client.FetchMetadata(context.Background())
+	require.NoError(t, err)
+
+	// Ensure essential information is fetched
+
+	for _, broker := range resp.Brokers() {
+		// Only on server in the cluster
+		// [TODO] Test this meta data information once
+		// the client supports LeaderCount and PartitionCount
+		// require.Equal(t, int32(5), broker.LeaderCount())
+		// require.Equal(t, int32(5), broker.PartitionCount())
+		require.Equal(t, "localhost", broker.Host())
+		require.Equal(t, int32(5050), broker.Port())
+	}
 }
