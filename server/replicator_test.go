@@ -2,7 +2,6 @@ package server
 
 import (
 	"context"
-	"fmt"
 	"strconv"
 	"testing"
 	"time"
@@ -82,9 +81,9 @@ func stopFollowing(t *testing.T, p *partition) {
 	require.NoError(t, p.stopFollowing())
 }
 
-// Ensure messages are replicated and the stream leader fails over when the
+// Ensure messages are replicated and the partition leader fails over when the
 // leader dies.
-func TestStreamLeaderFailover(t *testing.T) {
+func TestPartitionLeaderFailover(t *testing.T) {
 	defer cleanupStorage(t)
 
 	// Use an external NATS server.
@@ -102,6 +101,7 @@ func TestStreamLeaderFailover(t *testing.T) {
 
 	// Configure second server.
 	s2Config := getTestConfig("b", false, 5051)
+	s2Config.EmbeddedNATS = false
 	s2Config.Clustering.ReplicaMaxLeaderTimeout = time.Second
 	s2Config.Clustering.ReplicaMaxIdleWait = 500 * time.Millisecond
 	s2Config.Clustering.ReplicaFetchTimeout = 500 * time.Millisecond
@@ -110,6 +110,7 @@ func TestStreamLeaderFailover(t *testing.T) {
 
 	// Configure second server.
 	s3Config := getTestConfig("c", false, 5052)
+	s3Config.EmbeddedNATS = false
 	s3Config.Clustering.ReplicaMaxLeaderTimeout = time.Second
 	s3Config.Clustering.ReplicaMaxIdleWait = 500 * time.Millisecond
 	s3Config.Clustering.ReplicaFetchTimeout = 500 * time.Millisecond
@@ -126,21 +127,21 @@ func TestStreamLeaderFailover(t *testing.T) {
 	subject := "foo"
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	err = client.CreateStream(ctx, subject, name, lift.ReplicationFactor(3))
+	err = client.CreateStream(ctx, subject, name, lift.ReplicationFactor(3), lift.Partitions(2))
 	require.NoError(t, err)
 
-	leader := getPartitionLeader(t, 10*time.Second, name, 0, servers...)
+	leader := getPartitionLeader(t, 10*time.Second, name, 1, servers...)
 
 	// Check partition load counts.
 	for _, server := range servers {
 		partitionCounts := server.metadata.BrokerPartitionCounts()
 		require.Len(t, partitionCounts, 3)
 		for _, s := range servers {
-			require.Equal(t, 1, partitionCounts[s.config.Clustering.ServerID])
+			require.Equal(t, 2, partitionCounts[s.config.Clustering.ServerID])
 		}
 		leaderCounts := server.metadata.BrokerLeaderCounts()
 		require.Len(t, leaderCounts, 1)
-		require.Equal(t, 1, leaderCounts[leader.config.Clustering.ServerID])
+		require.Equal(t, 2, leaderCounts[leader.config.Clustering.ServerID])
 	}
 
 	num := 100
@@ -156,7 +157,7 @@ func TestStreamLeaderFailover(t *testing.T) {
 	// Publish messages.
 	for i := 0; i < num; i++ {
 		_, err := client.Publish(context.Background(), name, expected[i].Value,
-			lift.Key(expected[i].Key), lift.AckPolicyAll())
+			lift.Key(expected[i].Key), lift.AckPolicyAll(), lift.ToPartition(1))
 		require.NoError(t, err)
 	}
 
@@ -175,7 +176,7 @@ func TestStreamLeaderFailover(t *testing.T) {
 			if i == num {
 				close(ch)
 			}
-		}, lift.StartAtEarliestReceived())
+		}, lift.StartAtEarliestReceived(), lift.Partition(1))
 	require.NoError(t, err)
 
 	select {
@@ -185,9 +186,9 @@ func TestStreamLeaderFailover(t *testing.T) {
 	}
 
 	// Wait for HW to update on followers.
-	waitForHW(t, 5*time.Second, name, 0, int64(num-1), servers...)
+	waitForHW(t, 5*time.Second, name, 1, int64(num-1), servers...)
 
-	// Kill the stream leader.
+	// Kill the partition leader.
 	leader.Stop()
 	followers := []*Server{}
 	for _, s := range servers {
@@ -198,7 +199,7 @@ func TestStreamLeaderFailover(t *testing.T) {
 	}
 
 	// Wait for new leader to be elected.
-	leader = getPartitionLeader(t, 10*time.Second, name, 0, followers...)
+	leader = getPartitionLeader(t, 10*time.Second, name, 1, followers...)
 
 	// Make sure the new leader's log is consistent.
 	i = 0
@@ -215,7 +216,7 @@ func TestStreamLeaderFailover(t *testing.T) {
 			if i == num {
 				close(ch)
 			}
-		}, lift.StartAtEarliestReceived())
+		}, lift.StartAtEarliestReceived(), lift.Partition(1))
 	require.NoError(t, err)
 
 	select {
@@ -227,7 +228,7 @@ func TestStreamLeaderFailover(t *testing.T) {
 	// Check partition load counts.
 	partitionCounts := leader.metadata.BrokerPartitionCounts()
 	require.Len(t, partitionCounts, 3)
-	require.Equal(t, 1, partitionCounts[leader.config.Clustering.ServerID])
+	require.Equal(t, 2, partitionCounts[leader.config.Clustering.ServerID])
 	leaderCounts := leader.metadata.BrokerLeaderCounts()
 	require.Equal(t, 1, leaderCounts[leader.config.Clustering.ServerID])
 }
@@ -688,10 +689,6 @@ func TestTruncatePreventReplicaDivergence(t *testing.T) {
 	s2 := runServerWithConfig(t, s2Config)
 	defer s2.Stop()
 
-	client, err := lift.Connect([]string{"localhost:5050", "localhost:5051"})
-	require.NoError(t, err)
-	defer client.Close()
-
 	// Configure third server.
 	s3Config := getTestConfig("c", false, 5052)
 	s3Config.Clustering.MinISR = 1
@@ -701,26 +698,21 @@ func TestTruncatePreventReplicaDivergence(t *testing.T) {
 	s3 := runServerWithConfig(t, s3Config)
 	defer s3.Stop()
 
-	// Configure forth server.
-	s4Config := getTestConfig("d", false, 5053)
-	s4Config.Clustering.MinISR = 1
-	s4Config.Clustering.ReplicaMaxLeaderTimeout = time.Second
-	s4Config.Clustering.ReplicaMaxIdleWait = 500 * time.Millisecond
-	s4Config.Clustering.ReplicaFetchTimeout = 500 * time.Millisecond
-	s4 := runServerWithConfig(t, s4Config)
-	defer s4.Stop()
+	servers := []*Server{s1, s2, s3}
 
-	servers := []*Server{s1, s2, s3, s4}
+	client, err := lift.Connect([]string{"localhost:5050", "localhost:5051", "localhost:5052"})
+	require.NoError(t, err)
+	defer client.Close()
 
 	// Create stream.
 	name := "foo"
 	subject := "foo"
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	err = client.CreateStream(ctx, subject, name, lift.ReplicationFactor(4))
+	err = client.CreateStream(ctx, subject, name, lift.ReplicationFactor(3))
 	require.NoError(t, err)
 
-	// Wait until the stream is created
+	// Wait until the stream is created.
 	waitForPartition(t, 5*time.Second, name, 0, servers...)
 
 	// Publish two messages.
@@ -738,32 +730,23 @@ func TestTruncatePreventReplicaDivergence(t *testing.T) {
 	var (
 		follower1 *Server
 		follower2 *Server
-		follower3 *Server
 	)
-
-	if leader == s3 {
-		follower1 = s1
-		follower2 = s2
-		follower3 = s4
-	} else if leader == s4 {
-		follower1 = s1
-		follower2 = s2
-		follower3 = s3
-	} else if leader == s1 {
+	if leader == s1 {
 		follower1 = s2
 		follower2 = s3
-		follower3 = s4
 	} else if leader == s2 {
 		follower1 = s1
 		follower2 = s3
-		follower3 = s4
+	} else {
+		follower1 = s1
+		follower2 = s2
 	}
 
 	// At this point, all servers should have a HW of 1. Set the followers'
 	// HW to 0 to simulate a follower crashing before replicating (also
 	// disable replication to prevent them from advancing their HW from the
 	// leader).
-	waitForHW(t, 10*time.Second, name, 0, 1, servers...)
+	waitForHW(t, 5*time.Second, name, 0, 1, servers...)
 
 	// Stop first follower's replication and reset HW.
 	partition1 := follower1.metadata.GetPartition(name, 0)
@@ -784,7 +767,6 @@ func TestTruncatePreventReplicaDivergence(t *testing.T) {
 		follower1Config *Config
 		follower2Config *Config
 	)
-
 	if leader == s1 {
 		oldLeaderConfig = s1Config
 		follower1Config = s2Config
@@ -793,16 +775,12 @@ func TestTruncatePreventReplicaDivergence(t *testing.T) {
 		oldLeaderConfig = s2Config
 		follower1Config = s1Config
 		follower2Config = s3Config
-	} else if leader == s3 {
+	} else {
 		oldLeaderConfig = s3Config
 		follower1Config = s1Config
 		follower2Config = s2Config
-	} else if leader == s4 {
-		oldLeaderConfig = s4Config
-		follower1Config = s1Config
-		follower2Config = s2Config
-
 	}
+
 	// Stop replication on the leader to force a leader election.
 	partition := leader.metadata.GetPartition(name, 0)
 	require.NotNil(t, partition)
@@ -821,18 +799,13 @@ func TestTruncatePreventReplicaDivergence(t *testing.T) {
 	defer follower2.Stop()
 
 	// Wait for stream leader to be elected.
-	getPartitionLeader(t, 10*time.Second, name, 0, follower1, follower2, follower3)
+	getPartitionLeader(t, 10*time.Second, name, 0, follower1, follower2)
 
 	// Stop the old leader.
 	leader.Stop()
 
 	// Wait for ISR to shrink.
-	waitForISR(t, 10*time.Second, name, 0, 3, follower1, follower2, follower3)
-
-	host := fmt.Sprint("localhost:", follower1.port)
-	client, err = lift.Connect([]string{host})
-	require.NoError(t, err)
-	defer client.Close()
+	waitForISR(t, 10*time.Second, name, 0, 2, follower1, follower2)
 
 	// Publish new messages.
 	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
