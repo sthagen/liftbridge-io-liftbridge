@@ -1,6 +1,7 @@
 ---
-id: cursors
+id: version-v1.8.0-cursors
 title: Cursors
+original_id: cursors
 ---
 
 > **NOTE:** The cursors API is currently in beta. This includes the `SetCursor`

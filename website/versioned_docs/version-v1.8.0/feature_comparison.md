@@ -1,6 +1,7 @@
 ---
-id: feature-comparison
+id: version-v1.8.0-feature-comparison
 title: Feature Comparison
+original_id: feature-comparison
 ---
 
 Liftbridge shares some similarities with other stream-oriented pub/sub

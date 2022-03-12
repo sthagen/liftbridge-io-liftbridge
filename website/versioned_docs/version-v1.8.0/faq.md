@@ -1,6 +1,7 @@
 ---
-id: faq
+id: version-v1.8.0-faq
 title: Frequently Asked Questions
+original_id: faq
 ---
 
 ## What is Liftbridge?

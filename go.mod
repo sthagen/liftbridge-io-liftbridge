@@ -11,12 +11,12 @@ require (
 	github.com/hashicorp/golang-lru v0.5.4
 	github.com/hashicorp/raft v1.1.2
 	github.com/hashicorp/raft-boltdb/v2 v2.2.0
-	github.com/liftbridge-io/go-liftbridge/v2 v2.2.0
-	github.com/liftbridge-io/liftbridge-api v1.7.1
+	github.com/liftbridge-io/go-liftbridge/v2 v2.2.1-0.20220311002120-3d391a19ff0e
+	github.com/liftbridge-io/liftbridge-api v1.8.0
 	github.com/liftbridge-io/nats-on-a-log v0.0.0-20200818183806-bb17516cf3a3
 	github.com/natefinch/atomic v1.0.1
-	github.com/nats-io/nats-server/v2 v2.6.4
-	github.com/nats-io/nats.go v1.13.1-0.20211018182449-f2416a8b1483
+	github.com/nats-io/nats-server/v2 v2.7.2
+	github.com/nats-io/nats.go v1.13.1-0.20220121202836-972a071d373d
 	github.com/nats-io/nuid v1.0.1
 	github.com/pkg/errors v0.9.1
 	github.com/sirupsen/logrus v1.6.0
@@ -24,7 +24,7 @@ require (
 	github.com/stretchr/testify v1.7.0
 	github.com/tysonmote/gommap v0.0.1
 	github.com/urfave/cli v1.22.4
-	google.golang.org/grpc v1.43.0
+	google.golang.org/grpc v1.45.0
 )
 
 require (
@@ -45,7 +45,7 @@ require (
 	github.com/mattn/go-isatty v0.0.12 // indirect
 	github.com/minio/highwayhash v1.0.1 // indirect
 	github.com/mitchellh/mapstructure v1.3.2 // indirect
-	github.com/nats-io/jwt/v2 v2.1.0 // indirect
+	github.com/nats-io/jwt/v2 v2.2.1-0.20220113022732-58e87895b296 // indirect
 	github.com/nats-io/nkeys v0.3.0 // indirect
 	github.com/pelletier/go-toml v1.8.0 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
@@ -58,12 +58,12 @@ require (
 	github.com/spf13/pflag v1.0.5 // indirect
 	github.com/subosito/gotenv v1.2.0 // indirect
 	go.etcd.io/bbolt v1.3.5 // indirect
-	golang.org/x/crypto v0.0.0-20210616213533-5ff15b29337e // indirect
-	golang.org/x/net v0.0.0-20220121175114-2ed6ce1e1725 // indirect
-	golang.org/x/sys v0.0.0-20220114195835-da31bd327af9 // indirect
+	golang.org/x/crypto v0.0.0-20220112180741-5e0467b6c7ce // indirect
+	golang.org/x/net v0.0.0-20220225172249-27dd8689420f // indirect
+	golang.org/x/sys v0.0.0-20220310020820-b874c991c1a5 // indirect
 	golang.org/x/text v0.3.7 // indirect
-	golang.org/x/time v0.0.0-20200416051211-89c76fbcd5d1 // indirect
-	google.golang.org/genproto v0.0.0-20220118154757-00ab72f36ad5 // indirect
+	golang.org/x/time v0.0.0-20211116232009-f0f3c7e86c11 // indirect
+	google.golang.org/genproto v0.0.0-20220310185008-1973136f34c6 // indirect
 	google.golang.org/protobuf v1.27.1 // indirect
 	gopkg.in/ini.v1 v1.57.0 // indirect
 	gopkg.in/yaml.v2 v2.3.0 // indirect

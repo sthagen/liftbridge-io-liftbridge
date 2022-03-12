@@ -1,6 +1,7 @@
 ---
-id: overview
+id: version-v1.8.0-overview
 title: Liftbridge Overview
+original_id: overview
 ---
 
 Liftbridge is a server that implements a durable, replicated, and scalable

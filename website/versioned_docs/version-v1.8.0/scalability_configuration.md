@@ -1,6 +1,7 @@
 ---
-id: scalability-configuration
+id: version-v1.8.0-scalability-configuration
 title: Configuring for Scalability
+original_id: scalability-configuration
 ---
 
 Liftbridge is designed to be clustered and horizontally scalable, meaning nodes
