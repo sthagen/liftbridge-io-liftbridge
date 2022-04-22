@@ -815,10 +815,10 @@ func (p *partition) becomeLeader(epoch uint64) error {
 	// Start message processing loop.
 	recvChan := make(chan *nats.Msg, recvChannelSize)
 	p.stopLeader = make(chan struct{})
-	p.srv.startGoroutine(func() {
-		p.messageProcessingLoop(recvChan, p.stopLeader, epoch)
-		p.shutdown.Done()
-	})
+	p.srv.startGoroutineWithArgsWG(func(args ...interface{}) {
+		stop := args[0].(chan struct{})
+		p.messageProcessingLoop(recvChan, stop, epoch)
+	}, p.shutdown, p.stopLeader)
 
 	// Start replicating to followers.
 	p.startReplicating(epoch, p.stopLeader)
@@ -862,6 +862,11 @@ func (p *partition) becomeLeader(epoch uint64) error {
 	p.isLeading = true
 	p.isFollowing = false
 
+	// Notify the cursor manager if we've become leader for a cursor partition.
+	if p.Stream == cursorsStream {
+		p.srv.cursors.BecomePartitionLeader()
+	}
+
 	return nil
 }
 
@@ -886,11 +891,6 @@ func (p *partition) stopLeading() error {
 	}
 
 	// Stop processing messages and replicating.
-	p.shutdown.Add(1) // Message processing loop
-	p.shutdown.Add(1) // Commit loop
-	if replicas := len(p.replicas); replicas > 1 {
-		p.shutdown.Add(replicas - 1) // Replicator loops (minus one to exclude self)
-	}
 	close(p.stopLeader)
 
 	// Wait for loops to shutdown. Release mutex while we wait to avoid
@@ -1283,8 +1283,9 @@ func (p *partition) processPendingMessage(offset int64, msg *commitlog.Message) 
 		p.sendAck(ack)
 	}
 	if err := p.commitQueue.Put(ack); err != nil {
-		// This is very bad and should not happen.
-		panic(fmt.Sprintf("Failed to add message to commit queue: %v", err))
+		// An error here indicates the queue was disposed as a result of the
+		// leader stepping down.
+		p.srv.logger.Errorf("Failed to add message to commit queue for partition %s: %v", p, err)
 	}
 }
 
@@ -1295,10 +1296,9 @@ func (p *partition) startReplicating(epoch uint64, stop chan struct{}) {
 		p.srv.logger.Debugf("Replicating partition %s to followers", p)
 	}
 	p.commitQueue = queue.New(100)
-	p.srv.startGoroutine(func() {
+	p.srv.startGoroutineWG(func() {
 		p.commitLoop(stop)
-		p.shutdown.Done()
-	})
+	}, p.shutdown)
 
 	p.replicators = make(map[string]*replicator, len(p.replicas)-1)
 	for replica := range p.replicas {
@@ -1308,10 +1308,9 @@ func (p *partition) startReplicating(epoch uint64, stop chan struct{}) {
 		}
 		r := newReplicator(epoch, replica, p)
 		p.replicators[replica] = r
-		p.srv.startGoroutine(func() {
-			r.start(stop)
-			p.shutdown.Done()
-		})
+		p.srv.api.startGoroutineWithArgsWG(func(args ...interface{}) {
+			args[0].(*replicator).start(stop)
+		}, p.shutdown, r)
 	}
 }
 

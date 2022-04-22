@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/casbin/casbin/v2"
 	"github.com/hashicorp/raft"
 	client "github.com/liftbridge-io/liftbridge-api/go"
 	gnatsd "github.com/nats-io/nats-server/v2/server"
@@ -53,6 +54,12 @@ type RaftLogListener interface {
 	Receive(*RaftLog)
 }
 
+// authzEnforcer contains a casbin enforcer and a lock, which is used to reload permissions safely
+type authzEnforcer struct {
+	enforcer  *casbin.Enforcer
+	authzLock sync.RWMutex
+}
+
 // Server is the main Liftbridge object. Create it by calling New or
 // RunServerWithConfig.
 type Server struct {
@@ -83,6 +90,7 @@ type Server struct {
 	cursors            *cursorManager
 	raftLogListenersMu sync.RWMutex
 	raftLogListeners   []RaftLogListener
+	authzEnforcer      *authzEnforcer
 }
 
 // RunServerWithConfig creates and starts a new Server with the given
@@ -439,6 +447,7 @@ func (s *Server) startAPIServer() error {
 
 		config.Certificates = []tls.Certificate{certificate}
 
+		// Configure Authentication
 		if s.config.TLSClientAuth {
 			config.ClientAuth = tls.RequireAndVerifyClientCert
 
@@ -455,6 +464,21 @@ func (s *Server) startAPIServer() error {
 
 				config.ClientCAs = certPool
 			}
+		}
+		// Configure authorization
+		if s.config.TLSClientAuthz && s.config.TLSClientAuthzModel != "" && s.config.TLSClientAuthzPolicy != "" {
+			opts = append(opts, grpc.UnaryInterceptor(AuthzUnaryInterceptor), grpc.StreamInterceptor(AuthzStreamInterceptor))
+			policyEnforcer, err := casbin.NewEnforcer(s.config.TLSClientAuthzModel, s.config.TLSClientAuthzPolicy)
+			if err != nil {
+				return errors.Wrap(err, "failed to initialize authorization policy enforcer")
+			}
+			err = policyEnforcer.LoadPolicy()
+
+			if err != nil {
+				return errors.Wrap(err, "failed to load authorization permissions")
+			}
+
+			s.authzEnforcer = &authzEnforcer{enforcer: policyEnforcer}
 		}
 
 		creds := credentials.NewTLS(&config)
@@ -842,6 +866,25 @@ func (s *Server) startGoroutine(f func()) {
 	}()
 }
 
+// startGoroutineWG starts a goroutine which is managed by the server and calls
+// Done() on the provided WaitGroup upon completion. This adds the goroutine to
+// a WaitGroup so that the server can wait for all running goroutines to stop
+// on shutdown. This should be used instead of a "naked" goroutine.
+func (s *Server) startGoroutineWG(f func(), wg sync.WaitGroup) {
+	select {
+	case <-s.shutdownCh:
+		return
+	default:
+	}
+	s.goroutineWait.Add(1)
+	wg.Add(1)
+	go func() {
+		f()
+		wg.Done()
+		s.goroutineWait.Done()
+	}()
+}
+
 // startGoroutineWithArgs starts a goroutine which is managed by the server and
 // is passed the provided arguments. This adds the goroutine to a WaitGroup so
 // that the server can wait for all running goroutines to stop on shutdown.
@@ -855,6 +898,26 @@ func (s *Server) startGoroutineWithArgs(f func(...interface{}), args ...interfac
 	s.goroutineWait.Add(1)
 	go func() {
 		f(args...)
+		s.goroutineWait.Done()
+	}()
+}
+
+// startGoroutineWithArgsWG starts a goroutine which is managed by the server
+// and is passed the provided arguments and calls Done() on the provided
+// WaitGroup upon completion. This adds the goroutine to a WaitGroup so that
+// the server can wait for all running goroutines to stop on shutdown. This
+// should be used instead of a "naked" goroutine.
+func (s *Server) startGoroutineWithArgsWG(f func(...interface{}), wg sync.WaitGroup, args ...interface{}) {
+	select {
+	case <-s.shutdownCh:
+		return
+	default:
+	}
+	s.goroutineWait.Add(1)
+	wg.Add(1)
+	go func() {
+		f(args...)
+		wg.Done()
 		s.goroutineWait.Done()
 	}()
 }

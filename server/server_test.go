@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"io/ioutil"
 	"os"
@@ -116,6 +118,21 @@ func waitForNoMetadataLeader(t *testing.T, timeout time.Duration, servers ...*Se
 		time.Sleep(15 * time.Millisecond)
 	}
 	stackFatalf(t, "Metadata leader found")
+}
+
+func waitForClusterSize(t *testing.T, timeout time.Duration, leader *Server, size int) []raft.Server {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		future := leader.getRaft().GetConfiguration()
+		require.NoError(t, future.Error())
+		servers := future.Configuration().Servers
+		if len(servers) == size {
+			return servers
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	stackFatalf(t, "Cluster did not reach size %d", size)
+	return nil
 }
 
 func checkPartitionPaused(t *testing.T, timeout time.Duration, stream string,
@@ -449,7 +466,7 @@ func TestBootstrapManualConfigMaxQuorum(t *testing.T) {
 		defer server.Stop()
 	}
 
-	leader := getMetadataLeader(t, 10*time.Second, servers...)
+	leader := getMetadataLeader(t, 20*time.Second, servers...)
 
 	// Verify configuration.
 	future := leader.getRaft().GetConfiguration()
@@ -463,10 +480,10 @@ func TestBootstrapManualConfigMaxQuorum(t *testing.T) {
 		nonVoters = 0
 	)
 	for _, server := range configServers {
-		if server.Suffrage == raft.Staging || server.Suffrage == raft.Voter {
-			voters++
-		} else {
+		if server.Suffrage == raft.Nonvoter {
 			nonVoters++
+		} else {
+			voters++
 		}
 	}
 	require.Equal(t, 2, voters)
@@ -477,12 +494,7 @@ func TestBootstrapManualConfigMaxQuorum(t *testing.T) {
 	newServer := runServerWithConfig(t, config)
 	defer newServer.Stop()
 
-	future = leader.getRaft().GetConfiguration()
-	if err := future.Error(); err != nil {
-		t.Fatalf("Unexpected error on GetConfiguration: %v", err)
-	}
-	configServers = future.Configuration().Servers
-	require.Equal(t, 4, len(configServers))
+	configServers = waitForClusterSize(t, 10*time.Second, leader, 4)
 	for _, server := range configServers {
 		if server.ID == "d" {
 			require.Equal(t, raft.Nonvoter, server.Suffrage)
@@ -1203,26 +1215,6 @@ func TestSubscribeStartTime(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("Did not receive expected message")
 	}
-}
-
-// Ensure clients can connect with TLS when enabled.
-func TestTLS(t *testing.T) {
-	defer cleanupStorage(t)
-
-	// Configure server with TLS.
-	s1Config, err := NewConfig("./configs/tls.yaml")
-	require.NoError(t, err)
-	s1 := runServerWithConfig(t, s1Config)
-	defer s1.Stop()
-
-	// Connect with TLS.
-	client, err := lift.Connect([]string{"localhost:5050"}, lift.TLSCert("./configs/certs/server.crt"))
-	require.NoError(t, err)
-	defer client.Close()
-
-	// Connecting without a cert should fail.
-	_, err = lift.Connect([]string{"localhost:5050"})
-	require.Error(t, err)
 }
 
 // Ensure that the host address is the same as the listen address when
@@ -1958,4 +1950,40 @@ func TestRaftLogListener(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("Did not receive expected Raft logs")
 	}
+}
+
+// Ensure client authentification ( but not with authorization)
+func TestTLSAuth(t *testing.T) {
+	defer cleanupStorage(t)
+
+	// Configure server with TLS.
+	s1Config, err := NewConfig("./configs/tls.yaml")
+	require.NoError(t, err)
+	s1 := runServerWithConfig(t, s1Config)
+	defer s1.Stop()
+
+	// Connect with TLS.
+
+	certPool := x509.NewCertPool()
+	ca, err := ioutil.ReadFile("./configs/certs/ca-cert.pem")
+	if err != nil {
+		panic(err)
+	}
+	certPool.AppendCertsFromPEM(ca)
+	certificate, err := tls.LoadX509KeyPair("./configs/certs/client/client-cert.pem", "./configs/certs/client/client-key.pem")
+	if err != nil {
+		panic(err)
+	}
+	config := &tls.Config{
+		ServerName:   "localhost",
+		Certificates: []tls.Certificate{certificate},
+		RootCAs:      certPool,
+	}
+	client, err := lift.Connect([]string{"localhost:5050"}, lift.TLSConfig(config))
+	require.NoError(t, err)
+	defer client.Close()
+
+	// Connecting without a cert should fail.
+	_, err = lift.Connect([]string{"localhost:5050"})
+	require.Error(t, err)
 }
