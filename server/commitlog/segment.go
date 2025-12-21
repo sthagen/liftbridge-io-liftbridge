@@ -69,6 +69,7 @@ type segment struct {
 	sealed         bool
 	closed         bool
 	replaced       bool
+	deleted        bool // marked for deletion, excluded from read path
 
 	sync.RWMutex
 }
@@ -87,7 +88,7 @@ func newSegment(path string, baseOffset, maxBytes int64, isNew bool, suffix stri
 	if isNew && exists(s.logPath()) {
 		return nil, ErrSegmentExists
 	}
-	log, err := os.OpenFile(s.logPath(), os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
+	log, err := os.OpenFile(s.logPath(), os.O_RDWR|os.O_CREATE|os.O_APPEND, 0644)
 	if err != nil {
 		return nil, errors.Wrap(err, "open file failed")
 	}
@@ -108,6 +109,7 @@ func newSegment(path string, baseOffset, maxBytes int64, isNew bool, suffix stri
 // - Initialize index position
 // - Initialize firstOffset/lastOffset
 // - Initialize firstWriteTime/lastWriteTime
+// If the index is corrupt, it will attempt to rebuild it from the log file.
 func (s *segment) setupIndex() (err error) {
 	s.Index, err = newIndex(options{
 		path:       s.indexPath(),
@@ -118,7 +120,19 @@ func (s *segment) setupIndex() (err error) {
 	}
 	lastEntry, err := s.Index.InitializePosition()
 	if err != nil {
-		return err
+		if err == errIndexCorrupt {
+			// Index is corrupt, attempt to rebuild from log file
+			if rebuildErr := s.rebuildIndex(); rebuildErr != nil {
+				return errors.Wrap(rebuildErr, "failed to rebuild corrupt index")
+			}
+			// Re-initialize after rebuild
+			lastEntry, err = s.Index.InitializePosition()
+			if err != nil {
+				return errors.Wrap(err, "failed to initialize rebuilt index")
+			}
+		} else {
+			return err
+		}
 	}
 	// If lastEntry is nil, the index is empty.
 	if lastEntry != nil {
@@ -132,6 +146,103 @@ func (s *segment) setupIndex() (err error) {
 		s.firstOffset = firstEntry.Offset
 		s.firstWriteTime = firstEntry.Timestamp
 	}
+	return nil
+}
+
+// rebuildIndex rebuilds the index by scanning the log file.
+// This is called when a corrupt index is detected.
+func (s *segment) rebuildIndex() error {
+	// Close and remove the corrupt index
+	if s.Index != nil {
+		s.Index.Close() // Ignore close errors on corrupt index
+	}
+	if err := os.Remove(s.indexPath()); err != nil && !os.IsNotExist(err) {
+		return errors.Wrap(err, "failed to remove corrupt index file")
+	}
+
+	// Create a fresh index
+	var err error
+	s.Index, err = newIndex(options{
+		path:       s.indexPath(),
+		baseOffset: s.BaseOffset,
+	})
+	if err != nil {
+		return errors.Wrap(err, "failed to create new index")
+	}
+
+	// Reset index position to 0 so we write from the beginning.
+	// newIndex() sets position = file size (10MB pre-allocated), but we need
+	// to write from the start. We can't call InitializePosition() here because
+	// it would fail on ReadAt due to position bounds checking. After we rebuild
+	// the entries, setupIndex will call InitializePosition() to finalize.
+	s.Index.mu.Lock()
+	s.Index.position = 0
+	s.Index.mu.Unlock()
+
+	// If log file is empty, we're done
+	if s.position == 0 {
+		return nil
+	}
+
+	// Scan the log file and rebuild index entries
+	var pos int64
+	headerBuf := make([]byte, msgSetHeaderLen)
+
+	for pos < s.position {
+		// Read message set header
+		n, err := s.log.ReadAt(headerBuf, pos)
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return errors.Wrap(err, "failed to read log during index rebuild")
+		}
+		if n < msgSetHeaderLen {
+			// Partial header, stop here
+			break
+		}
+
+		ms := messageSet(headerBuf)
+		offset := ms.Offset()
+		timestamp := ms.Timestamp()
+		leaderEpoch := ms.LeaderEpoch()
+		size := ms.Size()
+
+		// Validate the entry looks reasonable
+		if size < 0 || size > 100*1024*1024 { // Max 100MB message
+			// Invalid size, stop here
+			break
+		}
+
+		// Check we have enough data for the full message
+		if pos+msgSetHeaderLen+int64(size) > s.position {
+			// Incomplete message, stop here
+			break
+		}
+
+		// Create index entry
+		e := &entry{
+			Offset:      offset,
+			Timestamp:   timestamp,
+			LeaderEpoch: leaderEpoch,
+			Position:    pos,
+			Size:        size + msgSetHeaderLen,
+		}
+
+		if err := s.Index.writeEntries([]*entry{e}); err != nil {
+			return errors.Wrap(err, "failed to write index entry during rebuild")
+		}
+
+		pos += msgSetHeaderLen + int64(size)
+	}
+
+	// After rebuilding, set position to file size so InitializePosition() can
+	// read all entries during its binary search. The entries we wrote are
+	// non-zero, and the rest of the pre-allocated file is zeros (empty entries).
+	s.Index.mu.Lock()
+	s.Index.position = s.Index.size
+	s.Index.mu.Unlock()
+
 	return nil
 }
 
@@ -366,7 +477,7 @@ func (s *segment) Replace(old *segment) error {
 		return err
 	}
 	s.suffix = ""
-	log, err := os.OpenFile(s.logPath(), os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
+	log, err := os.OpenFile(s.logPath(), os.O_RDWR|os.O_CREATE|os.O_APPEND, 0644)
 	if err != nil {
 		return errors.Wrap(err, "open file failed")
 	}
@@ -450,6 +561,22 @@ func (s *segment) Delete() error {
 		}
 	}
 	return nil
+}
+
+// MarkDeleted marks the segment as deleted, removing it from the read path.
+// This should be called before actually deleting files to ensure readers
+// don't see the segment while deletion is in progress.
+func (s *segment) MarkDeleted() {
+	s.Lock()
+	defer s.Unlock()
+	s.deleted = true
+}
+
+// IsDeleted returns true if the segment has been marked for deletion.
+func (s *segment) IsDeleted() bool {
+	s.RLock()
+	defer s.RUnlock()
+	return s.deleted
 }
 
 type segmentScanner struct {

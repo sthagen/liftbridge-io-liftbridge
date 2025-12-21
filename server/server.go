@@ -4,8 +4,6 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
-	"io/ioutil"
-	"math/rand"
 	"net"
 	"os"
 	"path/filepath"
@@ -132,8 +130,6 @@ func (s *Server) Start() (err error) {
 			s.Stop()
 		}
 	}()
-
-	rand.Seed(time.Now().UnixNano())
 
 	// Create the data directory if it doesn't exist.
 	if err := os.MkdirAll(s.config.DataDir, os.ModePerm); err != nil {
@@ -327,7 +323,7 @@ func (s *Server) getConnectionAddress() HostPort {
 func (s *Server) recoverAndPersistState() error {
 	// Attempt to recover state.
 	file := filepath.Join(s.config.DataDir, stateFile)
-	data, err := ioutil.ReadFile(file)
+	data, err := os.ReadFile(file)
 	if err == nil {
 		// Recovered previous state.
 		state := &proto.ServerState{}
@@ -342,7 +338,7 @@ func (s *Server) recoverAndPersistState() error {
 	if err != nil {
 		panic(err)
 	}
-	return ioutil.WriteFile(file, data, 0666)
+	return os.WriteFile(file, data, 0600)
 }
 
 // startEmbeddedNATS starts a NATS server embedded in this process. It returns
@@ -352,6 +348,12 @@ func (s *Server) startEmbeddedNATS() error {
 	if err != nil {
 		return err
 	}
+	// Disable NATS signal handling to prevent race with Liftbridge's signal
+	// handler. Without this, both servers register handlers for SIGINT/SIGTERM
+	// and whichever runs first wins - if NATS wins, it calls os.Exit()
+	// immediately, preventing Liftbridge from performing graceful shutdown.
+	// See: https://github.com/liftbridge-io/liftbridge/issues/373
+	opts.NoSigs = true
 	s.embeddedNATS, err = gnatsd.NewServer(opts)
 	if err != nil {
 		return err
@@ -453,7 +455,7 @@ func (s *Server) startAPIServer() error {
 
 			if s.config.TLSClientAuthCA != "" {
 				certPool := x509.NewCertPool()
-				ca, err := ioutil.ReadFile(s.config.TLSClientAuthCA)
+				ca, err := os.ReadFile(s.config.TLSClientAuthCA)
 				if err != nil {
 					return errors.Wrap(err, "failed to load TLS client ca certificate")
 				}
