@@ -90,15 +90,17 @@ func (l *logger) Fatal(v ...interface{}) {
 // Silent is used to enable and disable log silencing. Silent must be called
 // with true before it can be called with false.
 func (l *logger) Silent(enable bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	if enable {
 		l.oldOut = l.Out
-		l.Out = io.Discard
+		l.SetOutput(io.Discard)
 	} else {
 		oldOut := l.oldOut
 		if oldOut == nil {
 			panic("Must enable logger.Silent before disabling")
 		}
-		l.Out = oldOut
+		l.SetOutput(oldOut)
 	}
 }
 
