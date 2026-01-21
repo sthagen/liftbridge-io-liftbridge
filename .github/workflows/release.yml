@@ -637,11 +637,12 @@ jobs:
         uses: actions/download-artifact@v7
         with:
           pattern: liftbridge-*
-          merge-multiple: true
-          path: ./release-artifacts
+          path: ./artifacts
 
-      - name: List artifacts
+      - name: Flatten artifacts
         run: |
+          mkdir -p ./release-artifacts
+          find ./artifacts -type f \( -name "*.tar.gz" -o -name "*.sha256" -o -name "*.deb" -o -name "*.rpm" \) -exec cp {} ./release-artifacts/ \;
           echo "Release artifacts:"
           ls -la ./release-artifacts/
 
