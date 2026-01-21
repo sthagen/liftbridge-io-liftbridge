@@ -633,11 +633,40 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Download all artifacts
+      - name: Download binary artifacts
         uses: actions/download-artifact@v7
         with:
-          pattern: liftbridge-*
+          pattern: liftbridge-darwin-*
           path: ./artifacts
+        continue-on-error: true
+
+      - name: Download linux binary artifacts
+        uses: actions/download-artifact@v7
+        with:
+          pattern: liftbridge-linux-*
+          path: ./artifacts
+        continue-on-error: true
+
+      - name: Download windows binary artifacts
+        uses: actions/download-artifact@v7
+        with:
+          pattern: liftbridge-windows-*
+          path: ./artifacts
+        continue-on-error: true
+
+      - name: Download debian artifacts
+        uses: actions/download-artifact@v7
+        with:
+          pattern: liftbridge-debian-*
+          path: ./artifacts
+        continue-on-error: true
+
+      - name: Download rpm artifacts
+        uses: actions/download-artifact@v7
+        with:
+          pattern: liftbridge-rpm-*
+          path: ./artifacts
+        continue-on-error: true
 
       - name: Flatten artifacts
         run: |
@@ -645,6 +674,11 @@ jobs:
           find ./artifacts -type f \( -name "*.tar.gz" -o -name "*.sha256" -o -name "*.deb" -o -name "*.rpm" \) -exec cp {} ./release-artifacts/ \;
           echo "Release artifacts:"
           ls -la ./release-artifacts/
+          # Verify we have artifacts
+          if [ -z "$(ls -A ./release-artifacts/)" ]; then
+            echo "Error: No artifacts found!"
+            exit 1
+          fi
 
       - name: Generate release notes
         run: |
