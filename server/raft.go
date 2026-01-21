@@ -63,13 +63,9 @@ func (t *timeoutFuture) Error() error {
 		return t.err
 	}
 
-	errC := make(chan error)
+	errC := make(chan error, 1)
 	go func() {
-		err := t.wrapped.Error()
-		select {
-		case errC <- err:
-		default:
-		}
+		errC <- t.wrapped.Error()
 	}()
 
 	var err error
