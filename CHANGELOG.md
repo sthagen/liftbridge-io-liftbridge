@@ -11,11 +11,11 @@ This replaces the previous semantic versioning (v1.x.x) to better reflect the pr
 
 ---
 
-## v26.01.1 (Unreleased)
+## v26.01.1 (2026-01-21)
 
 ### Breaking Changes
 - **Versioning**: Changed from semantic versioning (v1.x.x) to CalVer (YY.MM.PATCH)
-- **Go version**: Minimum requirement changed from 1.21 to 1.25.3
+- **Go version**: Minimum requirement changed from 1.21 to 1.25.6
 - **Version variable**: `server.Version` changed from `const` to `var` for build-time injection
 
 ### New Features
@@ -94,6 +94,28 @@ export LIFTBRIDGE_TELEMETRY_ENABLED=false
 ```
 
 See the [Telemetry Documentation](https://docs.basekick.net/liftbridge/operations/telemetry) for full details.
+
+#### Performance Optimizations & Benchmark Tools
+Added benchmark tools and server-side optimizations achieving **241K msgs/sec** throughput.
+
+**Benchmark Results** (single node, RF=1, 256-byte messages):
+| Configuration | Throughput | Latency (P99) |
+|--------------|------------|---------------|
+| 1 publisher, synchronous | ~30K msgs/sec | 306µs |
+| 1 publisher, pub-batch=100 | ~139K msgs/sec | 1.0ms |
+| 4 publishers, pub-batch=100 | ~241K msgs/sec | 2.0ms |
+| 256 publishers, synchronous | ~200K msgs/sec | 1.4ms |
+
+For comparison, NATS JetStream achieves ~220K msgs/sec with similar settings.
+
+**Optimizations**:
+- Fast path for RF=1 partitions (skips commit queue for LEADER/NONE ack policies)
+- Timer-based message batching support
+
+**Benchmark Tools**:
+- `bench/producer` - Producer benchmark with HDR histogram latency tracking
+- `bench/consumer` - Consumer benchmark for throughput measurement
+- Support for concurrent publishers and async batching (`--pub-batch` flag)
 
 ### Dependencies Updated
 | Package | Before | After |

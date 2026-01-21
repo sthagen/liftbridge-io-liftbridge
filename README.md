@@ -1,6 +1,6 @@
 ![Liftbridge Logo](./website/static/img/liftbridge_full.png)
 ---
-[![Build][Build-Status-Image]][Build-Status-Url] [![License][License-Image]][License-Url] [![ReportCard][ReportCard-Image]][ReportCard-Url] [![Go Version](https://img.shields.io/badge/go-1.25.3-blue)](https://go.dev/)
+[![Build][Build-Status-Image]][Build-Status-Url] [![License][License-Image]][License-Url] [![ReportCard][ReportCard-Image]][ReportCard-Url] [![Go Version](https://img.shields.io/badge/go-1.25.6-blue)](https://go.dev/)
 
 Liftbridge provides lightweight, fault-tolerant message streams by implementing
 a durable, replicated, and scalable message log. The vision for Liftbridge is
@@ -23,7 +23,7 @@ This project is maintained by [Basekick Labs](https://github.com/basekick-labs),
 
 ## Requirements
 
-- Go 1.25.3+
+- Go 1.25.6+
 - NATS Server v2.10.0+
 
 ## Documentation
